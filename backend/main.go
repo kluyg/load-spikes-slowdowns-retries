@@ -34,6 +34,8 @@ const (
 	completionChan  = "completions"
 	configKey       = "config"
 	latencyUntilKey = "chaos:latency_until_ms"
+	inflightKey     = "metric:inflight"        // durable gauge (frontend INCRs, we DECR)
+	throughputKey   = "metric:throughput_total" // durable counter of work done
 	latencyMult     = 4
 	longtailSigma   = 0.9 // spread of the long-tail lognormal
 )
@@ -163,9 +165,12 @@ func runWorker(ctx context.Context, rdb *redis.Client) {
 			continue
 		}
 
+		// Every popped item was counted in-flight by the frontend at enqueue;
+		// decrement the durable gauge once it is resolved here (done/dropped/bad).
 		var item workItem
 		if err := json.Unmarshal([]byte(res[1]), &item); err != nil {
 			log.Printf("bad work item: %v", err)
+			rdb.Decr(ctx, inflightKey)
 			continue
 		}
 
@@ -182,6 +187,7 @@ func runWorker(ctx context.Context, rdb *redis.Client) {
 			drop = item.DeadlineMs > 0 && now+cfg.MarginMs > item.DeadlineMs
 		}
 		if drop {
+			rdb.Decr(ctx, inflightKey)
 			publish(ctx, rdb, item.ID, "dropped")
 			continue
 		}
@@ -191,6 +197,8 @@ func runWorker(ctx context.Context, rdb *redis.Client) {
 		if err := rdb.Set(ctx, "op:"+item.ID, "done", time.Hour).Err(); err != nil {
 			log.Printf("set error: %v", err)
 		}
+		rdb.Incr(ctx, throughputKey)
+		rdb.Decr(ctx, inflightKey)
 		publish(ctx, rdb, item.ID, "done")
 	}
 }

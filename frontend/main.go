@@ -43,6 +43,8 @@ const (
 	completionChan  = "completions"
 	configKey       = "config"
 	latencyUntilKey = "chaos:latency_until_ms"
+	inflightKey     = "metric:inflight"        // durable gauge (we INCR, backend DECRs)
+	throughputKey   = "metric:throughput_total" // durable counter of work done
 	chaosDuration   = 8 * time.Second
 	sampleInterval  = 250 * time.Millisecond
 )
@@ -87,13 +89,13 @@ type snapshot struct {
 	TsMs         int64   `json:"ts_ms"`
 }
 
+// metrics holds frontend-local request counters. In-flight and throughput live
+// in Redis (durable counters) rather than here, so they survive pub/sub loss.
 type metrics struct {
 	startWork  atomic.Int64
 	getOp      atomic.Int64
 	rpcSuccess atomic.Int64
 	rpcFailure atomic.Int64
-	completed  atomic.Int64 // backend "done" completions (throughput)
-	inFlight   atomic.Int64
 	latest     atomic.Pointer[snapshot]
 }
 
@@ -176,6 +178,9 @@ func (s *server) loadConfig(ctx context.Context) Config {
 	return c
 }
 
+// subscribeCompletions feeds only the GetOperation fast-path. Pub/sub is
+// at-most-once, so it is never used as a source of truth: the durable "op:<id>"
+// SET (checked as a fallback in GetOperation) and the Redis metric counters are.
 func (s *server) subscribeCompletions(ctx context.Context) {
 	sub := s.rdb.Subscribe(ctx, completionChan)
 	for msg := range sub.Channel() {
@@ -183,10 +188,8 @@ func (s *server) subscribeCompletions(ctx context.Context) {
 		if err := json.Unmarshal([]byte(msg.Payload), &c); err != nil {
 			continue
 		}
-		s.m.inFlight.Add(-1)
 		if c.Status == "done" {
 			s.done.Store(c.ID, struct{}{})
-			s.m.completed.Add(1)
 		}
 	}
 }
@@ -199,9 +202,10 @@ func (s *server) runSampler(ctx context.Context) {
 	for range t.C {
 		sw, gop := s.m.startWork.Load(), s.m.getOp.Load()
 		ok, er := s.m.rpcSuccess.Load(), s.m.rpcFailure.Load()
-		done := s.m.completed.Load()
 		qlen, _ := s.rdb.LLen(ctx, workQueueKey).Result()
-		inflight := s.m.inFlight.Load()
+		// Durable gauge + counter (immune to pub/sub loss).
+		done := getInt(ctx, s.rdb, throughputKey)
+		inflight := getInt(ctx, s.rdb, inflightKey)
 		if inflight < 0 {
 			inflight = 0
 		}
@@ -243,7 +247,7 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.m.rpcSuccess.Add(1)
-	s.m.inFlight.Add(1)
+	s.rdb.Incr(r.Context(), inflightKey) // durable in-flight gauge; backend DECRs on resolve
 	writeJSON(w, map[string]string{"operation_id": id})
 }
 
@@ -331,6 +335,14 @@ func (s *server) handleChaosLatency(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"until_ms": until, "duration_ms": chaosDuration.Milliseconds()})
+}
+
+func getInt(ctx context.Context, rdb *redis.Client, key string) int64 {
+	n, err := rdb.Get(ctx, key).Int64()
+	if err != nil {
+		return 0 // missing key (e.g. after flush) reads as zero
+	}
+	return n
 }
 
 func randHex() string {
