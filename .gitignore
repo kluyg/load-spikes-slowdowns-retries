@@ -1,0 +1,23 @@
+# Compiled Go binaries
+*.exe
+*.exe~
+/backend/server
+/frontend/server
+
+# Go test / profiling artifacts
+*.test
+*.out
+coverage.*
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local environment overrides
+.env
+*.local
+
+# Docker compose override (keep the base committed)
+docker-compose.override.yml
