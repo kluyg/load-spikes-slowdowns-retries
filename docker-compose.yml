@@ -8,11 +8,9 @@ services:
     build: ./backend
     environment:
       REDIS_ADDR: redis:6379
-      # Phase 0 defaults: capacity = CONCURRENCY / WORK_LATENCY ≈ 8 / 0.1s = 80 ops/s.
-      # Comfortably above the browser client's ~20 QPS, so the system stays healthy.
-      CONCURRENCY: "8"
-      WORK_LATENCY_MS: "100"
-      QUEUE_MODE: "FIFO"
+      # 4 workers x 50ms base latency => capacity ~= 80 ops/s, matching the
+      # "Shed your load" post. Latency and the other knobs are live-tunable.
+      CONCURRENCY: "4"
     depends_on:
       - redis
 

@@ -13,6 +13,7 @@
       --muted: #8b95a4;
       --accent: #58a6ff;
       --good: #3fb950;
+      --tput: #58a6ff;
       --warn: #d29922;
       --bad: #f85149;
     }
@@ -27,20 +28,17 @@
     header h1 { margin: 0; font-size: 18px; font-weight: 600; }
     header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
     main { padding: 24px; max-width: 1040px; margin: 0 auto; }
-    .controls {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 12px;
+    .panel {
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 16px;
-      margin-bottom: 24px;
+      margin-bottom: 16px;
     }
-    .controls label { color: var(--muted); }
-    .controls input {
-      width: 72px;
+    .panel h2 { margin: 0 0 12px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+    .row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 18px; }
+    label { color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+    input, select {
       background: var(--bg);
       border: 1px solid var(--border);
       color: var(--text);
@@ -48,6 +46,7 @@
       padding: 6px 8px;
       font: inherit;
     }
+    input[type=number] { width: 78px; }
     .spacer { flex: 1; }
     button {
       background: var(--accent);
@@ -64,44 +63,69 @@
     button.chaos.active { background: var(--warn); color: #1a1206; border-color: var(--warn); }
     .cards {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
       gap: 12px;
-      margin-bottom: 24px;
+      margin: 16px 0;
     }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 14px 16px;
-    }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
     .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
     .card .value { font-size: 26px; font-weight: 600; margin-top: 4px; }
     .card.goodput .value { color: var(--good); }
+    .card.tput .value { color: var(--tput); }
     .card.fail .value { color: var(--bad); }
     .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     @media (max-width: 720px) { .charts { grid-template-columns: 1fr; } }
-    .chart {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 16px;
-    }
-    .chart .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 8px; }
-    canvas { width: 100%; height: 160px; display: block; }
+    .chart { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+    .chart .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 8px; display: flex; gap: 14px; }
+    .legend { display: inline-flex; align-items: center; gap: 5px; }
+    .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+    canvas { width: 100%; height: 170px; display: block; }
   </style>
 </head>
 <body>
   <header>
     <h1>Load Spikes, Slowdowns &amp; Retries</h1>
-    <p>Phase 1 — live metrics over SSE, plus chaos: spike load or backend latency and watch goodput react.</p>
+    <p>Backend knobs &mdash; reproduce the throughput-vs-goodput dynamics from "Shed your load." Capacity &approx; 80 ops/s (4 workers &times; 50&nbsp;ms).</p>
   </header>
   <main>
-    <div class="controls">
-      <button id="toggle">Start load</button>
-      <label>Target QPS <input id="qps" type="number" value="20" min="1" max="200" /></label>
-      <span class="spacer"></span>
-      <button id="spike-load" class="chaos">Spike load 4&times;</button>
-      <button id="spike-latency" class="chaos">Spike latency 4&times;</button>
+    <div class="panel">
+      <h2>Load</h2>
+      <div class="row">
+        <button id="toggle">Start load</button>
+        <label>Target QPS <input id="qps" type="number" value="60" min="1" max="400" /></label>
+        <label>Client deadline (ms) <input id="client-deadline" type="number" value="1000" min="100" max="10000" step="100" /></label>
+        <span class="spacer"></span>
+        <button id="spike-load" class="chaos">Spike load 4&times;</button>
+        <button id="spike-latency" class="chaos">Spike latency 4&times;</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Backend parameters</h2>
+      <div class="row">
+        <label>Queue strategy
+          <select id="queue-mode">
+            <option value="FIFO">FIFO (oldest first)</option>
+            <option value="LIFO">LIFO (newest first)</option>
+          </select>
+        </label>
+        <label>Queue max size <input id="queue-max" type="number" value="0" min="0" /> <span style="color:var(--muted)">(0 = unbounded)</span></label>
+        <label>Deadline propagation
+          <select id="deadline-mode">
+            <option value="none">None (always do work)</option>
+            <option value="expired">Drop if past deadline</option>
+            <option value="margin">Drop if now + margin &gt; deadline</option>
+          </select>
+        </label>
+        <label>Margin (ms) <input id="margin-ms" type="number" value="70" min="0" /></label>
+        <label>Work latency
+          <select id="latency-mode">
+            <option value="uniform">Uniform</option>
+            <option value="longtail">Long-tail</option>
+          </select>
+        </label>
+        <label>Base latency (ms) <input id="latency-ms" type="number" value="50" min="1" /></label>
+      </div>
     </div>
 
     <div class="cards">
@@ -109,13 +133,13 @@
         <div class="label">Goodput</div>
         <div class="value"><span id="m-goodput">0</span> <small>ops/s</small></div>
       </div>
+      <div class="card tput">
+        <div class="label">Throughput</div>
+        <div class="value"><span id="m-tput">0</span> <small>ops/s</small></div>
+      </div>
       <div class="card">
         <div class="label">RPC QPS</div>
         <div class="value" id="m-qps">0</div>
-      </div>
-      <div class="card">
-        <div class="label">RPC success/s</div>
-        <div class="value" id="m-success">0</div>
       </div>
       <div class="card fail">
         <div class="label">RPC fail/s</div>
@@ -133,11 +157,15 @@
 
     <div class="charts">
       <div class="chart">
-        <div class="label">Goodput (ops/s, last 60s)</div>
-        <canvas id="goodput-chart"></canvas>
+        <div class="label">
+          <span class="legend"><span class="swatch" style="background:var(--tput)"></span>Throughput</span>
+          <span class="legend"><span class="swatch" style="background:var(--good)"></span>Goodput</span>
+          <span style="color:var(--muted)">(ops/s, 60s)</span>
+        </div>
+        <canvas id="main-chart"></canvas>
       </div>
       <div class="chart">
-        <div class="label">Queue length (last 60s)</div>
+        <div class="label"><span class="legend"><span class="swatch" style="background:var(--warn)"></span>Queue length</span> <span style="color:var(--muted)">(60s)</span></div>
         <canvas id="queue-chart"></canvas>
       </div>
     </div>

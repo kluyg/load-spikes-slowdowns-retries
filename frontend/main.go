@@ -4,13 +4,16 @@
 //	POST /api/start          StartWork    — enqueue a work item, return an op id
 //	GET  /api/op?id=         GetOperation — report whether that op has completed
 //	GET  /api/stream         SSE stream of server-side metrics
+//	GET  /api/config         current live knobs
+//	POST /api/config         update live knobs (stored in a Redis hash)
 //	POST /api/chaos/latency  trigger a short 4x backend-latency spike
 //
 // Completions are learned by subscribing to the Redis pub/sub channel the
 // backend publishes to (the "message queue").
 //
-// Phase 1: no load shedding yet — every request is accepted, so RPC failures
-// stay at zero. Shedding (and the failures it produces) arrives in a later phase.
+// Phase 2a (backend knobs): the frontend owns the "queue max size" knob (it
+// rejects StartWork when the queue is full) and propagates each client's
+// deadline into the work item. Load shedding and client retries arrive later.
 package main
 
 import (
@@ -24,6 +27,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +41,7 @@ var staticFS embed.FS
 const (
 	workQueueKey    = "work:queue"
 	completionChan  = "completions"
+	configKey       = "config"
 	latencyUntilKey = "chaos:latency_until_ms"
 	chaosDuration   = 8 * time.Second
 	sampleInterval  = 250 * time.Millisecond
@@ -45,35 +50,58 @@ const (
 type workItem struct {
 	ID         string `json:"id"`
 	EnqueuedMs int64  `json:"enqueued_ms"`
+	DeadlineMs int64  `json:"deadline_ms"`
+}
+
+type completion struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+}
+
+// Config holds the live-tunable knobs. The frontend acts on QueueMax; the rest
+// are owned by the backend but stored/served here so the UI has one place to
+// read and write them.
+type Config struct {
+	QueueMode    string `json:"queue_mode"`
+	QueueMax     int64  `json:"queue_max"` // 0 = unbounded
+	DeadlineMode string `json:"deadline_mode"`
+	MarginMs     int64  `json:"margin_ms"`
+	LatencyMode  string `json:"latency_mode"`
+	LatencyMs    int64  `json:"latency_ms"`
+}
+
+func defaultConfig() Config {
+	return Config{QueueMode: "FIFO", QueueMax: 0, DeadlineMode: "none", MarginMs: 70, LatencyMode: "uniform", LatencyMs: 50}
 }
 
 // snapshot is the server-side metric sample streamed to the browser. Goodput is
-// deliberately absent: it is measured in the client, since that is where a
-// request is observed to actually succeed.
+// absent on purpose: it's measured in the client, where success is observed.
 type snapshot struct {
 	StartWorkQPS float64 `json:"start_work_qps"`
 	GetOpQPS     float64 `json:"get_op_qps"`
 	RPCSuccessPS float64 `json:"rpc_success_ps"`
 	RPCFailurePS float64 `json:"rpc_failure_ps"`
+	ThroughputPS float64 `json:"throughput_ps"` // backend completions/s (work done)
 	InFlight     int64   `json:"in_flight"`
 	QueueLen     int64   `json:"queue_len"`
 	TsMs         int64   `json:"ts_ms"`
 }
 
-// metrics holds the raw atomic counters plus the latest published sample.
 type metrics struct {
 	startWork  atomic.Int64
 	getOp      atomic.Int64
 	rpcSuccess atomic.Int64
 	rpcFailure atomic.Int64
+	completed  atomic.Int64 // backend "done" completions (throughput)
 	inFlight   atomic.Int64
 	latest     atomic.Pointer[snapshot]
 }
 
 type server struct {
-	rdb  *redis.Client
-	m    metrics
-	done sync.Map // operation_id -> struct{}, populated from pub/sub
+	rdb    *redis.Client
+	m      metrics
+	cfgPtr atomic.Pointer[Config]
+	done   sync.Map
 }
 
 func main() {
@@ -83,6 +111,7 @@ func main() {
 
 	go s.subscribeCompletions(context.Background())
 	go s.runSampler(context.Background())
+	go s.refreshConfig(context.Background())
 
 	static, err := fs.Sub(staticFS, "static")
 	if err != nil {
@@ -94,6 +123,8 @@ func main() {
 	mux.HandleFunc("/api/start", s.handleStart)
 	mux.HandleFunc("/api/op", s.handleGetOp)
 	mux.HandleFunc("/api/stream", s.handleStream)
+	mux.HandleFunc("/api/metrics", s.handleMetrics)
+	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/chaos/latency", s.handleChaosLatency)
 
 	listen := ":" + getenv("PORT", "8080")
@@ -101,24 +132,74 @@ func main() {
 	log.Fatal(http.ListenAndServe(listen, mux))
 }
 
-func (s *server) subscribeCompletions(ctx context.Context) {
-	sub := s.rdb.Subscribe(ctx, completionChan)
-	for msg := range sub.Channel() {
-		s.done.Store(msg.Payload, struct{}{})
-		s.m.inFlight.Add(-1)
+func (s *server) currentConfig() Config {
+	if c := s.cfgPtr.Load(); c != nil {
+		return *c
+	}
+	return defaultConfig()
+}
+
+func (s *server) refreshConfig(ctx context.Context) {
+	t := time.NewTicker(250 * time.Millisecond)
+	defer t.Stop()
+	for {
+		cfg := s.loadConfig(ctx)
+		s.cfgPtr.Store(&cfg)
+		<-t.C
 	}
 }
 
-// runSampler converts the raw counters into per-second rates every tick and
-// publishes a snapshot that every SSE client reads.
+func (s *server) loadConfig(ctx context.Context) Config {
+	c := defaultConfig()
+	m, err := s.rdb.HGetAll(ctx, configKey).Result()
+	if err != nil {
+		return c
+	}
+	if v := m["queue_mode"]; v != "" {
+		c.QueueMode = v
+	}
+	if v := m["deadline_mode"]; v != "" {
+		c.DeadlineMode = v
+	}
+	if v := m["latency_mode"]; v != "" {
+		c.LatencyMode = v
+	}
+	if n, err := strconv.ParseInt(m["queue_max"], 10, 64); err == nil {
+		c.QueueMax = n
+	}
+	if n, err := strconv.ParseInt(m["margin_ms"], 10, 64); err == nil {
+		c.MarginMs = n
+	}
+	if n, err := strconv.ParseInt(m["latency_ms"], 10, 64); err == nil && n > 0 {
+		c.LatencyMs = n
+	}
+	return c
+}
+
+func (s *server) subscribeCompletions(ctx context.Context) {
+	sub := s.rdb.Subscribe(ctx, completionChan)
+	for msg := range sub.Channel() {
+		var c completion
+		if err := json.Unmarshal([]byte(msg.Payload), &c); err != nil {
+			continue
+		}
+		s.m.inFlight.Add(-1)
+		if c.Status == "done" {
+			s.done.Store(c.ID, struct{}{})
+			s.m.completed.Add(1)
+		}
+	}
+}
+
 func (s *server) runSampler(ctx context.Context) {
 	t := time.NewTicker(sampleInterval)
 	defer t.Stop()
 	dt := sampleInterval.Seconds()
-	var lsw, lgo, lok, lerr int64
+	var lsw, lgo, lok, lerr, ldone int64
 	for range t.C {
 		sw, gop := s.m.startWork.Load(), s.m.getOp.Load()
 		ok, er := s.m.rpcSuccess.Load(), s.m.rpcFailure.Load()
+		done := s.m.completed.Load()
 		qlen, _ := s.rdb.LLen(ctx, workQueueKey).Result()
 		inflight := s.m.inFlight.Load()
 		if inflight < 0 {
@@ -129,19 +210,32 @@ func (s *server) runSampler(ctx context.Context) {
 			GetOpQPS:     float64(gop-lgo) / dt,
 			RPCSuccessPS: float64(ok-lok) / dt,
 			RPCFailurePS: float64(er-lerr) / dt,
+			ThroughputPS: float64(done-ldone) / dt,
 			InFlight:     inflight,
 			QueueLen:     qlen,
 			TsMs:         time.Now().UnixMilli(),
 		})
-		lsw, lgo, lok, lerr = sw, gop, ok, er
+		lsw, lgo, lok, lerr, ldone = sw, gop, ok, er, done
 	}
 }
 
 // handleStart implements the StartWork RPC.
 func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 	s.m.startWork.Add(1)
+
+	// Queue-max knob: reject when the backlog is full (enqueue-time shedding).
+	cfg := s.currentConfig()
+	if cfg.QueueMax > 0 {
+		if n, _ := s.rdb.LLen(r.Context(), workQueueKey).Result(); n >= cfg.QueueMax {
+			s.m.rpcFailure.Add(1)
+			http.Error(w, "queue full", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
+	deadlineMs, _ := strconv.ParseInt(r.URL.Query().Get("deadline_ms"), 10, 64)
 	id := randHex()
-	item := workItem{ID: id, EnqueuedMs: time.Now().UnixMilli()}
+	item := workItem{ID: id, EnqueuedMs: time.Now().UnixMilli(), DeadlineMs: deadlineMs}
 	b, _ := json.Marshal(item)
 	if err := s.rdb.LPush(r.Context(), workQueueKey, b).Err(); err != nil {
 		s.m.rpcFailure.Add(1)
@@ -167,7 +261,41 @@ func (s *server) handleGetOp(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": status})
 }
 
-// handleStream pushes the latest metric snapshot to the browser over SSE.
+// handleConfig serves and updates the live knobs.
+func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		writeJSON(w, s.currentConfig())
+		return
+	}
+	var c Config
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.rdb.HSet(r.Context(), configKey, map[string]any{
+		"queue_mode":    c.QueueMode,
+		"queue_max":     c.QueueMax,
+		"deadline_mode": c.DeadlineMode,
+		"margin_ms":     c.MarginMs,
+		"latency_mode":  c.LatencyMode,
+		"latency_ms":    c.LatencyMs,
+	}).Err(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.cfgPtr.Store(&c) // reflect immediately; refresher keeps it in sync
+	writeJSON(w, c)
+}
+
+// handleMetrics returns the latest snapshot as plain JSON (handy for scripting).
+func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if snap := s.m.latest.Load(); snap != nil {
+		writeJSON(w, snap)
+		return
+	}
+	writeJSON(w, snapshot{})
+}
+
 func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -196,8 +324,6 @@ func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleChaosLatency arms a short-lived 4x backend-latency spike by writing the
-// deadline to Redis, where the backend picks it up.
 func (s *server) handleChaosLatency(w http.ResponseWriter, r *http.Request) {
 	until := time.Now().Add(chaosDuration).UnixMilli()
 	if err := s.rdb.Set(r.Context(), latencyUntilKey, until, 2*chaosDuration).Err(); err != nil {

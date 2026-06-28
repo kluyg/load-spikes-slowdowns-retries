@@ -38,22 +38,38 @@ near zero, and in-flight settle to a small number — a healthy system.
 
 ## Status
 
-**Phase 1** — the system is now observable and breakable:
+**Backend knobs** — live-tunable backend behavior that reproduces the
+throughput-vs-goodput dynamics from
+[Shed your load](https://strebkov.dev/posts/shed-your-load/):
 
-- All five server-side metrics (StartWork/GetOperation QPS, RPC success & failure
-  rates, in-flight work, queue length) stream to the UI over **Server-Sent
-  Events**. Goodput is measured client-side, where success is actually observed.
-- Two chaos buttons: **Spike load 4×** (client fires faster for 8s) and **Spike
-  latency 4×** (backend work latency quadruples for 8s, propagated via a Redis
-  flag).
+- **Queue strategy:** FIFO (serve oldest) vs LIFO (serve newest)
+- **Queue max size:** unbounded or a fixed cap (enqueue-time shedding)
+- **Deadline propagation:** none / drop if past deadline / drop if `now + margin >
+  deadline` ("refuse it now rather than discover the waste after")
+- **Work latency:** uniform vs long-tail (mean-preserving lognormal)
 
-Tunable knobs (retry strategies, load shedding, queue strategy/size, deadline
-propagation, latency distributions) and one-click scenario presets arrive in
-later phases.
+Each client request carries a **deadline**; if the backend can't satisfy it the
+client gives up, which is what makes **goodput** (useful, client-still-waiting
+completions) diverge from **throughput** (work done). The hero chart overlays the
+two.
+
+Measured with a headless load generator (60 qps baseline, 10s spike to 5×
+capacity, 1s deadline):
+
+| Scenario | Goodput (of offered) | Peak queue |
+|---|---|---|
+| FIFO, no deadline drop | 10% | 1953 |
+| LIFO, no deadline drop | 51% | 1929 |
+| FIFO, deadline + margin | 52% | 263 |
+
+Still to come: client retry strategies (which produce the self-sustaining
+metastable collapse), frontend load shedding, and one-click scenario presets.
 
 <details>
-<summary>Phase 0 — end-to-end skeleton</summary>
+<summary>Earlier phases</summary>
 
-One request type flows all the way through (browser → frontend → work queue →
-backend → completion → GetOperation) and live goodput renders in the browser.
+- **Phase 1** — all five server metrics stream over Server-Sent Events; chaos
+  buttons for a 4× load spike and a 4× backend-latency spike.
+- **Phase 0** — end-to-end skeleton: one request flows browser → frontend → work
+  queue → backend → completion → GetOperation, with live goodput.
 </details>
