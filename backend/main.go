@@ -2,9 +2,9 @@
 // doing the work, and publishes a completion notification so the frontend can
 // answer GetOperation calls.
 //
-// Phase 0: FIFO only, fixed work latency, fixed worker-pool concurrency. The
-// knobs (LIFO, bounded queue, deadline propagation, latency distributions)
-// arrive in later phases.
+// Phase 1: still FIFO with a fixed worker pool, but work latency can be spiked
+// 4x for a short window via a Redis flag the frontend sets (the "4x latency"
+// chaos button). The remaining knobs arrive in later phases.
 package main
 
 import (
@@ -14,17 +14,23 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 const (
-	workQueueKey   = "work:queue"
-	completionChan = "completions"
+	workQueueKey    = "work:queue"
+	completionChan  = "completions"
+	latencyUntilKey = "chaos:latency_until_ms"
+	latencyMult     = 4
 )
 
-// workItem is the unit of work the frontend enqueues and the backend consumes.
+// latencyUntilMs is a local cache of the latency-spike deadline (unix ms) so
+// workers don't hit Redis on every item. Refreshed by refreshChaos.
+var latencyUntilMs atomic.Int64
+
 type workItem struct {
 	ID         string `json:"id"`
 	EnqueuedMs int64  `json:"enqueued_ms"`
@@ -33,30 +39,46 @@ type workItem struct {
 func main() {
 	addr := getenv("REDIS_ADDR", "localhost:6379")
 	concurrency := getenvInt("CONCURRENCY", 8)
-	latency := time.Duration(getenvInt("WORK_LATENCY_MS", 100)) * time.Millisecond
+	baseLatency := time.Duration(getenvInt("WORK_LATENCY_MS", 100)) * time.Millisecond
 
 	rdb := redis.NewClient(&redis.Options{Addr: addr})
 	ctx := context.Background()
 
-	log.Printf("backend starting: concurrency=%d latency=%s redis=%s", concurrency, latency, addr)
+	log.Printf("backend starting: concurrency=%d base_latency=%s redis=%s", concurrency, baseLatency, addr)
 
-	// A fixed pool of workers. Service capacity ≈ concurrency / latency; this is
-	// the ceiling that arriving load has to stay under to avoid a backlog.
+	go refreshChaos(ctx, rdb)
+
 	var wg sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runWorker(ctx, rdb, latency)
+			runWorker(ctx, rdb, baseLatency)
 		}()
 	}
 	wg.Wait()
 }
 
-func runWorker(ctx context.Context, rdb *redis.Client, latency time.Duration) {
+// refreshChaos keeps the local view of the latency-spike window up to date.
+func refreshChaos(ctx context.Context, rdb *redis.Client) {
+	t := time.NewTicker(250 * time.Millisecond)
+	defer t.Stop()
+	for range t.C {
+		v, err := rdb.Get(ctx, latencyUntilKey).Int64()
+		if err == redis.Nil {
+			latencyUntilMs.Store(0)
+			continue
+		}
+		if err != nil {
+			continue // transient; keep the previous value
+		}
+		latencyUntilMs.Store(v)
+	}
+}
+
+func runWorker(ctx context.Context, rdb *redis.Client, baseLatency time.Duration) {
 	for {
 		// FIFO: the frontend LPUSHes, so the oldest item is at the tail (BRPOP).
-		// Switching to BLPOP later gives LIFO for free.
 		res, err := rdb.BRPop(ctx, 5*time.Second, workQueueKey).Result()
 		if err == redis.Nil {
 			continue // no work within the timeout; loop and block again
@@ -73,11 +95,14 @@ func runWorker(ctx context.Context, rdb *redis.Client, latency time.Duration) {
 			continue
 		}
 
-		// Simulate doing the work.
+		// Simulate doing the work — 4x slower while a latency spike is active.
+		latency := baseLatency
+		if time.Now().UnixMilli() < latencyUntilMs.Load() {
+			latency = baseLatency * latencyMult
+		}
 		time.Sleep(latency)
 
 		// Record the result and notify the frontend (the "message queue").
-		// The SET is the durable source of truth; the PUBLISH is the fast path.
 		if err := rdb.Set(ctx, "op:"+item.ID, "done", time.Hour).Err(); err != nil {
 			log.Printf("set error: %v", err)
 		}

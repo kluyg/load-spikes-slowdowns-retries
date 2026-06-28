@@ -1,30 +1,43 @@
-// Main-thread controller: owns the worker (client tier), aggregates the events
-// it emits into live metrics, polls the frontend for server-side metrics, and
-// renders the dashboard.
+// Main-thread controller: owns the worker (client tier), measures client-side
+// goodput, consumes the server's SSE metric stream, and renders the dashboard.
+
+const SPIKE_MS = 8000; // keep in sync with backend chaosDuration
 
 const worker = new Worker("/worker.js");
 
-let started = 0;
+// Client-observed counters.
 let completed = 0;
-let failed = 0;
 let completedThisSecond = 0;
-let queueLen = 0;
 let running = false;
 
-const goodputHistory = []; // last 60 one-second samples
+// Latest server-side snapshot from the SSE stream.
+let server = {
+  start_work_qps: 0,
+  get_op_qps: 0,
+  rpc_success_ps: 0,
+  rpc_failure_ps: 0,
+  in_flight: 0,
+  queue_len: 0,
+};
+
+const goodputHistory = [];
+const queueHistory = [];
 
 worker.onmessage = (e) => {
-  switch (e.data.type) {
-    case "started":
-      started++;
-      break;
-    case "completed":
-      completed++;
-      completedThisSecond++;
-      break;
-    case "failed":
-      failed++;
-      break;
+  if (e.data.type === "completed") {
+    completed++;
+    completedThisSecond++;
+  }
+};
+
+// --- Server metric stream (SSE) --------------------------------------------
+
+const es = new EventSource("/api/stream");
+es.onmessage = (e) => {
+  try {
+    server = JSON.parse(e.data);
+  } catch (err) {
+    /* ignore malformed frame */
   }
 };
 
@@ -32,6 +45,8 @@ worker.onmessage = (e) => {
 
 const toggleBtn = document.getElementById("toggle");
 const qpsInput = document.getElementById("qps");
+const spikeLoadBtn = document.getElementById("spike-load");
+const spikeLatencyBtn = document.getElementById("spike-latency");
 
 toggleBtn.onclick = () => {
   running = !running;
@@ -49,51 +64,66 @@ toggleBtn.onclick = () => {
 
 qpsInput.onchange = () => {
   worker.postMessage({ type: "config", qps: Number(qpsInput.value) });
-  if (running) worker.postMessage({ type: "start" }); // re-arm at new rate
 };
 
-// --- Metric sampling --------------------------------------------------------
+spikeLoadBtn.onclick = () => {
+  worker.postMessage({ type: "spike", factor: 4, durationMs: SPIKE_MS });
+  flash(spikeLoadBtn);
+};
+
+spikeLatencyBtn.onclick = async () => {
+  try {
+    await fetch("/api/chaos/latency", { method: "POST" });
+    flash(spikeLatencyBtn);
+  } catch (err) {
+    /* ignore */
+  }
+};
+
+// Show a button as "active" for the spike duration.
+function flash(btn) {
+  btn.classList.add("active");
+  setTimeout(() => btn.classList.remove("active"), SPIKE_MS);
+}
+
+// --- Sampling + rendering ---------------------------------------------------
 
 // Goodput is measured here, in the client, because this is where a request is
 // actually observed to succeed from the user's point of view.
 setInterval(() => {
-  goodputHistory.push(completedThisSecond);
-  if (goodputHistory.length > 60) goodputHistory.shift();
+  push(goodputHistory, completedThisSecond);
+  push(queueHistory, server.queue_len);
   render(completedThisSecond);
   completedThisSecond = 0;
 }, 1000);
 
-// Server-side metrics the browser can't see for itself.
-setInterval(async () => {
-  try {
-    const res = await fetch("/api/metrics");
-    const m = await res.json();
-    queueLen = m.queue_len ?? 0;
-  } catch (err) {
-    /* ignore transient errors */
-  }
-}, 500);
-
-// --- Rendering --------------------------------------------------------------
+function push(arr, v) {
+  arr.push(v);
+  if (arr.length > 60) arr.shift();
+}
 
 function render(goodput) {
   setText("m-goodput", goodput);
-  setText("m-started", started);
-  setText("m-completed", completed);
-  setText("m-failed", failed);
-  setText("m-inflight", Math.max(0, started - completed - failed));
-  setText("m-queue", queueLen);
-  drawChart();
+  setText("m-qps", Math.round(server.start_work_qps + server.get_op_qps));
+  setText("m-success", Math.round(server.rpc_success_ps));
+  setText("m-fail", Math.round(server.rpc_failure_ps));
+  setText("m-inflight", server.in_flight);
+  setText("m-queue", server.queue_len);
+  drawChart(goodputCanvas, goodputHistory, "#3fb950");
+  drawChart(queueCanvas, queueHistory, "#d29922");
 }
 
 function setText(id, value) {
   document.getElementById(id).textContent = value;
 }
 
-const canvas = document.getElementById("goodput-chart");
-const ctx = canvas.getContext("2d");
+// --- Charts -----------------------------------------------------------------
 
-function drawChart() {
+const goodputCanvas = document.getElementById("goodput-chart");
+const queueCanvas = document.getElementById("queue-chart");
+
+function drawChart(canvas, data, color) {
+  const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
@@ -102,28 +132,26 @@ function drawChart() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
 
-  const max = Math.max(10, ...goodputHistory);
-  const n = goodputHistory.length;
+  const n = data.length;
   if (n < 2) return;
-
+  const max = Math.max(10, ...data);
   const pad = 4;
   const stepX = (w - pad * 2) / 59;
   const scaleY = (h - pad * 2) / max;
 
   ctx.beginPath();
-  goodputHistory.forEach((v, i) => {
+  data.forEach((v, i) => {
     const x = pad + i * stepX;
     const y = h - pad - v * scaleY;
     i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
   });
-  ctx.strokeStyle = "#3fb950";
+  ctx.strokeStyle = color;
   ctx.lineWidth = 2;
   ctx.stroke();
 
-  // soft fill under the line
   ctx.lineTo(pad + (n - 1) * stepX, h - pad);
   ctx.lineTo(pad, h - pad);
   ctx.closePath();
-  ctx.fillStyle = "rgba(63, 185, 80, 0.12)";
+  ctx.fillStyle = color + "20"; // ~12% alpha fill
   ctx.fill();
 }

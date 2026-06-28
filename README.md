@@ -38,7 +38,22 @@ near zero, and in-flight settle to a small number — a healthy system.
 
 ## Status
 
-**Phase 0** — end-to-end skeleton: one request type flows all the way through
-and live goodput renders in the browser. Tunable knobs (retry strategies, load
-shedding, queue strategy/size, deadline propagation, latency distributions),
-the full metric stream, and the spike buttons arrive in later phases.
+**Phase 1** — the system is now observable and breakable:
+
+- All five server-side metrics (StartWork/GetOperation QPS, RPC success & failure
+  rates, in-flight work, queue length) stream to the UI over **Server-Sent
+  Events**. Goodput is measured client-side, where success is actually observed.
+- Two chaos buttons: **Spike load 4×** (client fires faster for 8s) and **Spike
+  latency 4×** (backend work latency quadruples for 8s, propagated via a Redis
+  flag).
+
+Tunable knobs (retry strategies, load shedding, queue strategy/size, deadline
+propagation, latency distributions) and one-click scenario presets arrive in
+later phases.
+
+<details>
+<summary>Phase 0 — end-to-end skeleton</summary>
+
+One request type flows all the way through (browser → frontend → work queue →
+backend → completion → GetOperation) and live goodput renders in the browser.
+</details>

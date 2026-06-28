@@ -2,11 +2,13 @@
 // issues real RPCs against the frontend: StartWork, then poll GetOperation
 // until the operation completes (the Long-Running-Operation pattern).
 //
-// Phase 0: a single open-loop request generator at a fixed QPS, no retries.
-// Retry strategies arrive in a later phase.
+// Phase 1: open-loop request generator at a fixed QPS, plus a short-lived "4x
+// load" spike. No retries yet — those arrive in a later phase.
 
-let timer = null;
-let qps = 20;
+let baseQps = 20;
+let running = false;
+let timer = null; // request-firing interval
+let spikeTimer = null; // ends the load spike
 
 const POLL_INTERVAL_MS = 200;
 const OP_TIMEOUT_MS = 30000; // safety net so a stuck op doesn't leak forever
@@ -15,27 +17,43 @@ self.onmessage = (e) => {
   const msg = e.data;
   switch (msg.type) {
     case "config":
-      qps = msg.qps;
+      baseQps = msg.qps;
+      // Don't disturb an active spike; it reverts to the new base when it ends.
+      if (running && spikeTimer === null) arm(baseQps);
       break;
     case "start":
-      startLoad();
+      running = true;
+      arm(baseQps);
       break;
     case "stop":
-      stopLoad();
+      running = false;
+      clearTimers();
+      break;
+    case "spike":
+      if (!running) break;
+      arm(baseQps * msg.factor);
+      clearTimeout(spikeTimer);
+      spikeTimer = setTimeout(() => {
+        spikeTimer = null;
+        if (running) arm(baseQps);
+      }, msg.durationMs);
       break;
   }
 };
 
-function startLoad() {
-  stopLoad();
-  const intervalMs = 1000 / qps;
-  timer = setInterval(fireRequest, intervalMs);
+function arm(qps) {
+  if (timer) clearInterval(timer);
+  timer = setInterval(fireRequest, 1000 / qps);
 }
 
-function stopLoad() {
+function clearTimers() {
   if (timer) {
     clearInterval(timer);
     timer = null;
+  }
+  if (spikeTimer) {
+    clearTimeout(spikeTimer);
+    spikeTimer = null;
   }
 }
 
@@ -50,11 +68,7 @@ async function fireRequest() {
     }
     const { operation_id } = await res.json();
     const ok = await pollUntilDone(operation_id, t0);
-    if (ok) {
-      self.postMessage({ type: "completed", latencyMs: performance.now() - t0 });
-    } else {
-      self.postMessage({ type: "failed" });
-    }
+    self.postMessage({ type: ok ? "completed" : "failed", latencyMs: performance.now() - t0 });
   } catch (err) {
     self.postMessage({ type: "failed" });
   }

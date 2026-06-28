@@ -13,6 +13,8 @@
       --muted: #8b95a4;
       --accent: #58a6ff;
       --good: #3fb950;
+      --warn: #d29922;
+      --bad: #f85149;
     }
     * { box-sizing: border-box; }
     body {
@@ -21,17 +23,15 @@
       background: var(--bg);
       color: var(--text);
     }
-    header {
-      padding: 20px 24px;
-      border-bottom: 1px solid var(--border);
-    }
+    header { padding: 20px 24px; border-bottom: 1px solid var(--border); }
     header h1 { margin: 0; font-size: 18px; font-weight: 600; }
     header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
-    main { padding: 24px; max-width: 960px; margin: 0 auto; }
+    main { padding: 24px; max-width: 1040px; margin: 0 auto; }
     .controls {
       display: flex;
       align-items: center;
-      gap: 16px;
+      flex-wrap: wrap;
+      gap: 12px;
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 8px;
@@ -48,17 +48,20 @@
       padding: 6px 8px;
       font: inherit;
     }
+    .spacer { flex: 1; }
     button {
       background: var(--accent);
       color: #06121f;
       border: 0;
       border-radius: 6px;
-      padding: 8px 18px;
+      padding: 8px 16px;
       font: inherit;
       font-weight: 600;
       cursor: pointer;
     }
-    button.stop { background: #f85149; color: #1a0606; }
+    button.stop { background: var(--bad); color: #1a0606; }
+    button.chaos { background: #21262d; color: var(--text); border: 1px solid var(--border); }
+    button.chaos.active { background: var(--warn); color: #1a1206; border-color: var(--warn); }
     .cards {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -74,6 +77,9 @@
     .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
     .card .value { font-size: 26px; font-weight: 600; margin-top: 4px; }
     .card.goodput .value { color: var(--good); }
+    .card.fail .value { color: var(--bad); }
+    .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 720px) { .charts { grid-template-columns: 1fr; } }
     .chart {
       background: var(--panel);
       border: 1px solid var(--border);
@@ -87,12 +93,15 @@
 <body>
   <header>
     <h1>Load Spikes, Slowdowns &amp; Retries</h1>
-    <p>Phase 0 — one request flowing end-to-end: browser client → frontend → work queue → backend → completion.</p>
+    <p>Phase 1 — live metrics over SSE, plus chaos: spike load or backend latency and watch goodput react.</p>
   </header>
   <main>
     <div class="controls">
       <button id="toggle">Start load</button>
       <label>Target QPS <input id="qps" type="number" value="20" min="1" max="200" /></label>
+      <span class="spacer"></span>
+      <button id="spike-load" class="chaos">Spike load 4&times;</button>
+      <button id="spike-latency" class="chaos">Spike latency 4&times;</button>
     </div>
 
     <div class="cards">
@@ -101,20 +110,20 @@
         <div class="value"><span id="m-goodput">0</span> <small>ops/s</small></div>
       </div>
       <div class="card">
-        <div class="label">Started</div>
-        <div class="value" id="m-started">0</div>
+        <div class="label">RPC QPS</div>
+        <div class="value" id="m-qps">0</div>
       </div>
       <div class="card">
-        <div class="label">Completed</div>
-        <div class="value" id="m-completed">0</div>
+        <div class="label">RPC success/s</div>
+        <div class="value" id="m-success">0</div>
+      </div>
+      <div class="card fail">
+        <div class="label">RPC fail/s</div>
+        <div class="value" id="m-fail">0</div>
       </div>
       <div class="card">
         <div class="label">In flight</div>
         <div class="value" id="m-inflight">0</div>
-      </div>
-      <div class="card">
-        <div class="label">Failed</div>
-        <div class="value" id="m-failed">0</div>
       </div>
       <div class="card">
         <div class="label">Queue length</div>
@@ -122,9 +131,15 @@
       </div>
     </div>
 
-    <div class="chart">
-      <div class="label">Goodput (ops/s, last 60s)</div>
-      <canvas id="goodput-chart"></canvas>
+    <div class="charts">
+      <div class="chart">
+        <div class="label">Goodput (ops/s, last 60s)</div>
+        <canvas id="goodput-chart"></canvas>
+      </div>
+      <div class="chart">
+        <div class="label">Queue length (last 60s)</div>
+        <canvas id="queue-chart"></canvas>
+      </div>
     </div>
   </main>
   <script src="/app.js"></script>
