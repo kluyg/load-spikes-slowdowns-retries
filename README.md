@@ -2,9 +2,12 @@
 
 An interactive, runnable distributed system for *seeing* how load, retries,
 latency, and load-shedding policies interact — and what they do to **goodput**
-(the rate of requests that actually succeed end-to-end).
+(the rate of requests that actually succeed end-to-end, while a client is still
+waiting for the answer).
 
-Builds on the ideas in [Shed your load](https://strebkov.dev/posts/shed-your-load/).
+Builds on the ideas in [Shed your load](https://strebkov.dev/posts/shed-your-load/),
+but as a real deployed system you can drive in the browser rather than a
+simulation.
 
 ## Architecture
 
@@ -18,12 +21,19 @@ Builds on the ideas in [Shed your load](https://strebkov.dev/posts/shed-your-loa
         +----------------- completion <----------------+
 ```
 
-- **Browser clients** — Web Workers that issue real RPCs and host the retry logic.
+- **Browser clients** — Web Workers that issue real RPCs and host the retry
+  logic. The same single page is the client tier, the control panel, and the
+  dashboards.
 - **Go frontend** — serves the UI, exposes `StartWork` / `GetOperation`, applies
-  load shedding (later phase), enqueues work, learns of completions via pub/sub.
-- **Go backend** — worker pool consuming the queue, simulating work latency.
+  load shedding, enqueues work, and learns of completions via pub/sub.
+- **Go backend** — worker pool consuming the queue, applying the queue/deadline
+  policies and simulating work latency.
 - **Redis** — the single backbone: work queue (list), completion bus (pub/sub),
-  and later config + metrics.
+  live config (hash), and metric counters.
+
+The request flow is the Long-Running-Operation poll pattern: `StartWork` returns
+an operation id; the client polls `GetOperation` until it's done or the client's
+deadline passes. Capacity ≈ workers ÷ latency = 4 ÷ 50 ms ≈ **80 ops/s**.
 
 ## Run
 
@@ -31,51 +41,87 @@ Builds on the ideas in [Shed your load](https://strebkov.dev/posts/shed-your-loa
 docker compose up --build
 ```
 
-No keys or external accounts needed — this is the full local stack.
+No keys or external accounts needed — this is the full local stack. Then open
+<http://localhost:8080>.
 
 > Optional: `docker compose --profile tailnet up` also starts a Tailscale sidecar
 > that serves the frontend on your tailnet (proxying to `frontend:8080` over the
-> Docker network). It needs `TS_AUTHKEY` in a gitignored `.env`; to stop it, use
-> `docker compose --profile tailnet down`. The plain command above is all a
-> reviewer needs. To host a durable public instance, see [DEPLOY.md](DEPLOY.md).
+> Docker network). It needs `TS_AUTHKEY` in a gitignored `.env`; stop it with
+> `docker compose --profile tailnet down`. To host a durable public instance, see
+> [DEPLOY.md](DEPLOY.md).
 
-Then open <http://localhost:8080>. The fastest tour is the **Scenarios** row at
-the top — each is one click, snaps every knob, and auto-fires the spike:
+## Try it: scenarios
 
-1. **Retry storm → collapse** — watch goodput crater and stay down after the spike.
-2. **Shed & survive** — same aggressive client, but load shedding holds goodput up.
-3. **Deadline + margin** — the backend-side cure: bounded queue, goodput survives.
+The fastest tour is the **Scenarios** row at the top. Each is one click — it
+snaps every knob (client, frontend, backend), starts load, and auto-fires the
+spike a few seconds in:
+
+1. **Healthy baseline** — normal load at ~75% capacity. Everything green.
+2. **Retry storm → collapse** — goodput craters and *stays down after the spike
+   ends*. The load is gone but the system is still dead.
+3. **Shed & survive** — same aggressive client, but load shedding holds goodput
+   at capacity and recovers instantly.
+4. **Deadline + margin** — the backend-side cure: bounded queue, goodput survives.
 
 Or drive the knobs yourself with **Start load** and the panels below.
 
-## Status
+## What you can tune
 
-**Client retries → metastable collapse** — the client tier supports retry
-strategies (none / immediate / exponential backoff / backoff + jitter) and a max
-retry count. Under overload, retries manufacture new load: a short spike tips the
-system into a self-sustaining collapse that persists *after* the spike ends —
-the load is gone but the system stays dead.
+- **Client:** target QPS · request deadline · retry strategy (none / immediate /
+  exponential backoff / backoff + jitter) · max retries.
+- **Frontend:** load shedding — none / fixed max QPS (a token bucket shared by
+  both RPCs) / in-flight quota. Sheds with HTTP 429, which the client treats as
+  backpressure (it gives up rather than retrying).
+- **Backend:** queue strategy (FIFO / LIFO) · queue max size · deadline
+  propagation (none / drop if past deadline / drop if `now + margin > deadline`) ·
+  work latency (uniform / long-tail, a mean-preserving lognormal).
+- **Chaos / ops:** 4× load spike · 4× backend-latency spike · operator
+  "Clear queue".
 
-Measured (60 qps baseline, 8s spike to 5× capacity, FIFO, no deadline drop):
+## Metrics
+
+Server-side metrics stream to the UI over Server-Sent Events: RPC QPS, RPC
+success/failure rate, in-flight work, queue length, and **throughput** (work the
+backend completed). **Goodput** is measured in the client, where success is
+actually observed. The hero chart overlays throughput and goodput — under
+overload, throughput stays flat while goodput falls off a cliff.
+
+## What it demonstrates
+
+The whole arc, each step reproducible from a preset and verified with a headless
+load generator.
+
+**1. Queue discipline and deadlines decide who survives overload.** A 10 s spike
+to 5× capacity, 1 s client deadline, no retries:
+
+| Backend policy | Goodput (of offered) | Peak queue |
+|---|---|---|
+| FIFO, no deadline drop | 10% | 1953 |
+| LIFO, no deadline drop | 51% | 1929 |
+| FIFO, deadline + margin | 52% | 263 |
+
+FIFO serves work whose clients already gave up; LIFO serves the freshest;
+deadline + margin refuses work it can't finish in time, rescuing goodput *and*
+bounding the queue.
+
+**2. Client retries turn a spike into a metastable collapse.** Same spike, FIFO,
+no deadline drop:
 
 | Client policy | Offered amplification | After the spike ends |
 |---|---|---|
 | No retry | 1× (3,775 attempts) | queue drains — system recovers |
 | Immediate retry ×5 | **5.3× (18,278 attempts)** | offered stuck at 300–1250/s, queue 5k→15k+, never recovers |
 
-There's an operator **"Clear queue"** lever that drops the whole backlog
-(orphaned operations then 404 on their next poll, and clients retry fresh). It
-does **not** fix the collapse: the 404'd operations all retry at once — a
-thundering herd that re-saturates the queue within a second or two. That's the
-point — a metastable collapse is sustained by *client* retry behavior, so a
-server-side flush is a band-aid the retry storm tears off.
+Retries manufacture new load that sustains the overload after the trigger is
+gone — a self-sustaining failure with no exit on its own.
 
-**Load shedding — the cure** — the frontend can shed load (none / fixed max QPS
-shared across both RPCs / in-flight quota), returning **429**. Crucially the
-client treats a 429 as backpressure — it gives up rather than retrying — so
-shedding both protects the backend *and* stops the retry storm from forming.
+**3. Clearing the queue does *not* fix it.** The operator "Clear queue" lever
+drops the whole backlog; the orphaned operations 404 on their next poll and all
+retry at once — a thundering herd that re-saturates the queue within seconds. A
+metastable collapse is sustained by *client* behavior, so a server-side flush is
+a band-aid the retry storm tears off.
 
-Same immediate-retry spike as above, with an in-flight quota of 70:
+**4. Load shedding is the cure.** Same immediate-retry spike, in-flight quota of 70:
 
 | | Shedding off | In-flight quota = 70 |
 |---|---|---|
@@ -85,47 +131,17 @@ Same immediate-retry spike as above, with an in-flight quota of 70:
 | Offered amplification | 5.25× | 1× (no retry storm) |
 | Total goodput | 12% | 59% |
 
-The full arc: backend knobs → retries cause a metastable collapse → clearing the
-queue can't fix it → load shedding with a well-behaved client does.
+Shedding caps the queue at the quota so the backend always has fresh work it can
+finish in time. Because the client honors the 429 (stops instead of retrying),
+shedding also prevents the retry storm from forming in the first place.
 
-**Scenario presets** (the **Scenarios** row in the UI) snap every knob — client,
-frontend, and backend — to one configuration and auto-fire the spike, so the
-whole arc is reproducible in one click each.
+## Implementation notes
 
-Still to come: backoff + jitter as a client-side mitigation.
-
-**Backend knobs** — live-tunable backend behavior that reproduces the
-throughput-vs-goodput dynamics from
-[Shed your load](https://strebkov.dev/posts/shed-your-load/):
-
-- **Queue strategy:** FIFO (serve oldest) vs LIFO (serve newest)
-- **Queue max size:** unbounded or a fixed cap (enqueue-time shedding)
-- **Deadline propagation:** none / drop if past deadline / drop if `now + margin >
-  deadline` ("refuse it now rather than discover the waste after")
-- **Work latency:** uniform vs long-tail (mean-preserving lognormal)
-
-Each client request carries a **deadline**; if the backend can't satisfy it the
-client gives up, which is what makes **goodput** (useful, client-still-waiting
-completions) diverge from **throughput** (work done). The hero chart overlays the
-two.
-
-Measured with a headless load generator (60 qps baseline, 10s spike to 5×
-capacity, 1s deadline):
-
-| Scenario | Goodput (of offered) | Peak queue |
-|---|---|---|
-| FIFO, no deadline drop | 10% | 1953 |
-| LIFO, no deadline drop | 51% | 1929 |
-| FIFO, deadline + margin | 52% | 263 |
-
-Still to come: frontend load shedding (the cure for the retry storm) and
-one-click scenario presets.
-
-<details>
-<summary>Earlier phases</summary>
-
-- **Phase 1** — all five server metrics stream over Server-Sent Events; chaos
-  buttons for a 4× load spike and a 4× backend-latency spike.
-- **Phase 0** — end-to-end skeleton: one request flows browser → frontend → work
-  queue → backend → completion → GetOperation, with live goodput.
-</details>
+- **Pub/sub is a fast path, never a source of truth.** `GetOperation` falls back
+  to a durable `op:<id>` key, and in-flight / throughput are durable Redis
+  counters — because Redis pub/sub is at-most-once and drops messages under the
+  exact overload these metrics exist to measure.
+- **Redis is the only broker:** work queue, completion bus, config, and metrics
+  all live in it, which keeps the moving parts minimal.
+- **Determinism caveat:** this is a real system, not a simulation, so absolute
+  numbers vary run to run; the *shapes* and orderings are the point.
