@@ -94,6 +94,15 @@
         <button id="toggle">Start load</button>
         <label>Target QPS <input id="qps" type="number" value="60" min="1" max="400" /></label>
         <label>Client deadline (ms) <input id="client-deadline" type="number" value="1000" min="100" max="10000" step="100" /></label>
+        <label>Retry
+          <select id="retry-strategy">
+            <option value="none">None</option>
+            <option value="immediate">Immediate</option>
+            <option value="backoff">Exp backoff</option>
+            <option value="jitter">Backoff + jitter</option>
+          </select>
+        </label>
+        <label>Max retries <input id="max-retries" type="number" value="0" min="0" max="20" /></label>
         <span class="spacer"></span>
         <button id="spike-load" class="chaos">Spike load 4&times;</button>
         <button id="spike-latency" class="chaos">Spike latency 4&times;</button>

@@ -44,6 +44,8 @@ const el = (id) => document.getElementById(id);
 const toggleBtn = el("toggle");
 const qpsInput = el("qps");
 const clientDeadlineInput = el("client-deadline");
+const retryStrategyInput = el("retry-strategy");
+const maxRetriesInput = el("max-retries");
 const spikeLoadBtn = el("spike-load");
 const spikeLatencyBtn = el("spike-latency");
 
@@ -102,6 +104,8 @@ function pushClientConfig() {
     type: "config",
     qps: Number(qpsInput.value),
     clientDeadlineMs: Number(clientDeadlineInput.value),
+    retryStrategy: retryStrategyInput.value,
+    maxRetries: Number(maxRetriesInput.value),
   });
 }
 
@@ -121,6 +125,8 @@ toggleBtn.onclick = () => {
 
 qpsInput.onchange = pushClientConfig;
 clientDeadlineInput.onchange = pushClientConfig;
+retryStrategyInput.onchange = pushClientConfig;
+maxRetriesInput.onchange = pushClientConfig;
 
 spikeLoadBtn.onclick = () => {
   worker.postMessage({ type: "spike", factor: 4, durationMs: SPIKE_MS });

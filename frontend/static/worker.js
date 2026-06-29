@@ -1,19 +1,20 @@
 // The browser-based client tier. Each Web Worker is a virtual client that
-// issues real RPCs against the frontend: StartWork, then poll GetOperation
-// until the operation completes or the client's deadline passes (the
-// Long-Running-Operation pattern).
-//
-// Phase 2a: each request carries a deadline. If the op isn't done by then, the
-// client gives up — that request counts as failed, not goodput. This is what
-// makes goodput diverge from throughput under overload. No retries yet.
+// issues real RPCs against the frontend. A *logical request* is one unit of work
+// the user wants done; it may take several *attempts* (StartWork + poll) under a
+// retry policy. Goodput counts logical requests that eventually succeed; offered
+// load counts attempts — and the gap between them is how retries manufacture new
+// load during overload (the metastable trap).
 
 let baseQps = 60;
 let clientDeadlineMs = 1000;
+let retryStrategy = "none"; // none | immediate | backoff | jitter
+let maxRetries = 0;
 let running = false;
-let timer = null; // request-firing interval
+let timer = null; // logical-request-firing interval
 let spikeTimer = null; // ends the load spike
 
 const POLL_INTERVAL_MS = 250;
+const BACKOFF_BASE_MS = 100;
 
 self.onmessage = (e) => {
   const msg = e.data;
@@ -21,6 +22,8 @@ self.onmessage = (e) => {
     case "config":
       if (msg.qps != null) baseQps = msg.qps;
       if (msg.clientDeadlineMs != null) clientDeadlineMs = msg.clientDeadlineMs;
+      if (msg.retryStrategy != null) retryStrategy = msg.retryStrategy;
+      if (msg.maxRetries != null) maxRetries = msg.maxRetries;
       if (running && spikeTimer === null) arm(baseQps);
       break;
     case "start":
@@ -45,7 +48,7 @@ self.onmessage = (e) => {
 
 function arm(qps) {
   if (timer) clearInterval(timer);
-  timer = setInterval(fireRequest, 1000 / qps);
+  timer = setInterval(runLogicalRequest, 1000 / qps);
 }
 
 function clearTimers() {
@@ -59,21 +62,43 @@ function clearTimers() {
   }
 }
 
-async function fireRequest() {
-  const deadline = Date.now() + clientDeadlineMs;
+// runLogicalRequest drives one user request through attempts under the retry
+// policy. Each retry is a fresh StartWork — that is the new load retries add.
+async function runLogicalRequest() {
   self.postMessage({ type: "started" });
-  try {
-    const res = await fetch("/api/start?deadline_ms=" + deadline, { method: "POST" });
-    if (!res.ok) {
-      // Rejected at the edge (e.g. queue full) — the client gave up.
+  let attempt = 0;
+  while (true) {
+    if (await oneAttempt()) {
+      self.postMessage({ type: "completed" });
+      return;
+    }
+    if (retryStrategy === "none" || attempt >= maxRetries) {
       self.postMessage({ type: "failed" });
       return;
     }
+    attempt++;
+    await sleep(retryDelay(attempt));
+  }
+}
+
+function retryDelay(attempt) {
+  if (retryStrategy === "immediate") return 0;
+  const exp = BACKOFF_BASE_MS * 2 ** (attempt - 1);
+  if (retryStrategy === "backoff") return exp;
+  if (retryStrategy === "jitter") return Math.random() * exp; // full jitter
+  return 0;
+}
+
+// oneAttempt makes a single StartWork call and polls until its deadline.
+async function oneAttempt() {
+  const deadline = Date.now() + clientDeadlineMs;
+  try {
+    const res = await fetch("/api/start?deadline_ms=" + deadline, { method: "POST" });
+    if (!res.ok) return false; // rejected at the edge
     const { operation_id } = await res.json();
-    const ok = await pollUntilDone(operation_id, deadline);
-    self.postMessage({ type: ok ? "completed" : "failed" });
+    return await pollUntilDone(operation_id, deadline);
   } catch (err) {
-    self.postMessage({ type: "failed" });
+    return false;
   }
 }
 
@@ -89,7 +114,7 @@ async function pollUntilDone(id, deadline) {
       // transient; keep polling until the deadline
     }
   }
-  return false; // client gave up
+  return false; // this attempt timed out
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

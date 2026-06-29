@@ -38,6 +38,21 @@ near zero, and in-flight settle to a small number — a healthy system.
 
 ## Status
 
+**Client retries → metastable collapse** — the client tier supports retry
+strategies (none / immediate / exponential backoff / backoff + jitter) and a max
+retry count. Under overload, retries manufacture new load: a short spike tips the
+system into a self-sustaining collapse that persists *after* the spike ends —
+the load is gone but the system stays dead.
+
+Measured (60 qps baseline, 8s spike to 5× capacity, FIFO, no deadline drop):
+
+| Client policy | Offered amplification | After the spike ends |
+|---|---|---|
+| No retry | 1× (3,775 attempts) | queue drains — system recovers |
+| Immediate retry ×5 | **5.3× (18,278 attempts)** | offered stuck at 300–1250/s, queue 5k→15k+, never recovers |
+
+The cure — frontend load shedding and backoff + jitter — is the next pass.
+
 **Backend knobs** — live-tunable backend behavior that reproduces the
 throughput-vs-goodput dynamics from
 [Shed your load](https://strebkov.dev/posts/shed-your-load/):
@@ -62,8 +77,8 @@ capacity, 1s deadline):
 | LIFO, no deadline drop | 51% | 1929 |
 | FIFO, deadline + margin | 52% | 263 |
 
-Still to come: client retry strategies (which produce the self-sustaining
-metastable collapse), frontend load shedding, and one-click scenario presets.
+Still to come: frontend load shedding (the cure for the retry storm) and
+one-click scenario presets.
 
 <details>
 <summary>Earlier phases</summary>
