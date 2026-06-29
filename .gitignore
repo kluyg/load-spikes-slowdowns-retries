@@ -21,3 +21,4 @@ Thumbs.db
 
 # Docker compose override (keep the base committed)
 docker-compose.override.yml
+.env
