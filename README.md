@@ -31,10 +31,14 @@ Builds on the ideas in [Shed your load](https://strebkov.dev/posts/shed-your-loa
 docker compose up --build
 ```
 
-Then open <http://localhost:8080> and click **Start load**.
+Then open <http://localhost:8080>. The fastest tour is the **Scenarios** row at
+the top — each is one click, snaps every knob, and auto-fires the spike:
 
-You should see goodput climb to roughly your target QPS, the queue length stay
-near zero, and in-flight settle to a small number — a healthy system.
+1. **Retry storm → collapse** — watch goodput crater and stay down after the spike.
+2. **Shed & survive** — same aggressive client, but load shedding holds goodput up.
+3. **Deadline + margin** — the backend-side cure: bounded queue, goodput survives.
+
+Or drive the knobs yourself with **Start load** and the panels below.
 
 ## Status
 
@@ -76,8 +80,11 @@ Same immediate-retry spike as above, with an in-flight quota of 70:
 The full arc: backend knobs → retries cause a metastable collapse → clearing the
 queue can't fix it → load shedding with a well-behaved client does.
 
-Still to come: backoff + jitter as a client-side mitigation, and one-click
-scenario presets.
+**Scenario presets** (the **Scenarios** row in the UI) snap every knob — client,
+frontend, and backend — to one configuration and auto-fire the spike, so the
+whole arc is reproducible in one click each.
+
+Still to come: backoff + jitter as a client-side mitigation.
 
 **Backend knobs** — live-tunable backend behavior that reproduces the
 throughput-vs-goodput dynamics from

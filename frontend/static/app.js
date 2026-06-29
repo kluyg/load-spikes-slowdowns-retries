@@ -240,4 +240,98 @@ function drawChart(canvas, series) {
   });
 }
 
+// --- Scenario presets -------------------------------------------------------
+
+// Each preset snaps every knob (client + frontend + backend) to tell one story.
+// autoSpike fires the matching chaos a few seconds in, so it's truly one-click.
+const PRESETS = [
+  {
+    name: "Healthy baseline",
+    desc: "Normal load at ~75% capacity — no retries, no shedding. Everything green.",
+    client: { qps: 60, clientDeadlineMs: 1000, retryStrategy: "none", maxRetries: 0 },
+    config: { shed_mode: "none", max_qps: 0, inflight_quota: 0, queue_mode: "FIFO", queue_max: 0, deadline_mode: "none", margin_ms: 70, latency_mode: "uniform", latency_ms: 50 },
+  },
+  {
+    name: "Retry storm → collapse",
+    desc: "Immediate retries, no shedding. Auto-spikes in 4s — goodput collapses and STAYS down after the spike ends (metastable). The load is gone but the system is still dead.",
+    client: { qps: 60, clientDeadlineMs: 1000, retryStrategy: "immediate", maxRetries: 5 },
+    config: { shed_mode: "none", max_qps: 0, inflight_quota: 0, queue_mode: "FIFO", queue_max: 0, deadline_mode: "none", margin_ms: 70, latency_mode: "uniform", latency_ms: 50 },
+    autoSpike: "load",
+  },
+  {
+    name: "Shed & survive",
+    desc: "Same aggressive client, but the frontend sheds beyond 70 in-flight (429 = stop, not retry). Auto-spikes in 4s — goodput holds at capacity and recovers instantly.",
+    client: { qps: 60, clientDeadlineMs: 1000, retryStrategy: "immediate", maxRetries: 5 },
+    config: { shed_mode: "inflight", max_qps: 0, inflight_quota: 70, queue_mode: "FIFO", queue_max: 0, deadline_mode: "none", margin_ms: 70, latency_mode: "uniform", latency_ms: 50 },
+    autoSpike: "load",
+  },
+  {
+    name: "Deadline + margin",
+    desc: "No shedding, but the backend refuses work it can't finish in time. Auto-spikes in 4s — queue stays bounded and goodput survives (the backend-side cure).",
+    client: { qps: 60, clientDeadlineMs: 1000, retryStrategy: "none", maxRetries: 0 },
+    config: { shed_mode: "none", max_qps: 0, inflight_quota: 0, queue_mode: "FIFO", queue_max: 0, deadline_mode: "margin", margin_ms: 70, latency_mode: "uniform", latency_ms: 50 },
+    autoSpike: "load",
+  },
+];
+
+let presetSpikeTimer = null;
+
+async function applyPreset(p, btn) {
+  if (presetSpikeTimer) clearTimeout(presetSpikeTimer);
+
+  // Reset server state so each scenario starts from a clean slate.
+  try {
+    await fetch("/api/admin/clear-queue", { method: "POST" });
+  } catch (err) {
+    /* ignore */
+  }
+
+  // Reflect the preset in every control, then push it to server + worker.
+  qpsInput.value = p.client.qps;
+  clientDeadlineInput.value = p.client.clientDeadlineMs;
+  retryStrategyInput.value = p.client.retryStrategy;
+  maxRetriesInput.value = p.client.maxRetries;
+  for (const k in p.config) {
+    if (cfgInputs[k]) cfgInputs[k].value = p.config[k];
+  }
+  await postConfig();
+  pushClientConfig();
+
+  if (!running) {
+    running = true;
+    worker.postMessage({ type: "start" });
+    toggleBtn.textContent = "Stop load";
+    toggleBtn.classList.add("stop");
+  }
+
+  el("preset-desc").textContent = p.desc;
+  document.querySelectorAll("#presets button").forEach((b) => b.classList.remove("active"));
+  if (btn) btn.classList.add("active");
+
+  if (p.autoSpike === "load") {
+    presetSpikeTimer = setTimeout(() => {
+      worker.postMessage({ type: "spike", factor: 4, durationMs: SPIKE_MS });
+      flash(spikeLoadBtn);
+    }, 4000);
+  } else if (p.autoSpike === "latency") {
+    presetSpikeTimer = setTimeout(async () => {
+      try {
+        await fetch("/api/chaos/latency", { method: "POST" });
+      } catch (err) {
+        /* ignore */
+      }
+      flash(spikeLatencyBtn);
+    }, 4000);
+  }
+}
+
+const presetsRow = el("presets");
+PRESETS.forEach((p) => {
+  const b = document.createElement("button");
+  b.className = "preset";
+  b.textContent = p.name;
+  b.onclick = () => applyPreset(p, b);
+  presetsRow.appendChild(b);
+});
+
 loadConfig();
