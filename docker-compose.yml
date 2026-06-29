@@ -14,29 +14,35 @@ services:
     depends_on:
       - redis
 
-  ts-frontend:
-    image: tailscale/tailscale:latest
-    environment:
-      - TS_AUTHKEY=${TS_AUTHKEY}
-      - TS_HOSTNAME=frontend            # → https://frontend.<your-tailnet>.ts.net
-      - TS_SERVE_CONFIG=/config/serve.json
-      - TS_STATE_DIR=/var/lib/tailscale
-    volumes:
-      - ts-state:/var/lib/tailscale     # persists identity across restarts
-      - ./ts-config:/config
-    ports:
-      - "8080:8080"                     # optional: keeps localhost:8080 working too
-    restart: unless-stopped
-
   frontend:
     build: ./frontend
     environment:
       REDIS_ADDR: redis:6379
       PORT: "8080"
-    network_mode: service:ts-frontend   # share the sidecar's network stack
+    ports:
+      - "8080:8080"
     depends_on:
       - redis
-      - ts-frontend
+
+  # Optional Tailscale sidecar. Only starts with:  docker compose --profile tailnet up
+  # It serves the frontend on your tailnet (https://frontend.<tailnet>.ts.net) by
+  # proxying to the frontend service over the Docker network. Needs TS_AUTHKEY in
+  # a (gitignored) .env file. The default `docker compose up` runs the plain local
+  # stack with no key required, so a reviewer can always run it.
+  ts-frontend:
+    image: tailscale/tailscale:latest
+    profiles: ["tailnet"]
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_HOSTNAME=frontend            # -> https://frontend.<your-tailnet>.ts.net
+      - TS_SERVE_CONFIG=/config/serve.json
+      - TS_STATE_DIR=/var/lib/tailscale
+    volumes:
+      - ts-state:/var/lib/tailscale     # persists identity across restarts
+      - ./ts-config:/config
+    depends_on:
+      - frontend
+    restart: unless-stopped
 
 volumes:
   ts-state:
