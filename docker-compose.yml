@@ -14,12 +14,29 @@ services:
     depends_on:
       - redis
 
+  ts-frontend:
+    image: tailscale/tailscale:latest
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_HOSTNAME=frontend            # → https://frontend.<your-tailnet>.ts.net
+      - TS_SERVE_CONFIG=/config/serve.json
+      - TS_STATE_DIR=/var/lib/tailscale
+    volumes:
+      - ts-state:/var/lib/tailscale     # persists identity across restarts
+      - ./ts-config:/config
+    ports:
+      - "8080:8080"                     # optional: keeps localhost:8080 working too
+    restart: unless-stopped
+
   frontend:
     build: ./frontend
     environment:
       REDIS_ADDR: redis:6379
       PORT: "8080"
-    ports:
-      - "8080:8080"
+    network_mode: service:ts-frontend   # share the sidecar's network stack
     depends_on:
       - redis
+      - ts-frontend
+
+volumes:
+  ts-state:
