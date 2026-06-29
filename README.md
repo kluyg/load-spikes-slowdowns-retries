@@ -37,7 +37,7 @@ No keys or external accounts needed — this is the full local stack.
 > that serves the frontend on your tailnet (proxying to `frontend:8080` over the
 > Docker network). It needs `TS_AUTHKEY` in a gitignored `.env`; to stop it, use
 > `docker compose --profile tailnet down`. The plain command above is all a
-> reviewer needs.
+> reviewer needs. To host a durable public instance, see [DEPLOY.md](DEPLOY.md).
 
 Then open <http://localhost:8080>. The fastest tour is the **Scenarios** row at
 the top — each is one click, snaps every knob, and auto-fires the spike:
