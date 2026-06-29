@@ -107,6 +107,7 @@ async function pollUntilDone(id, deadline) {
     await sleep(POLL_INTERVAL_MS);
     try {
       const res = await fetch("/api/op?id=" + encodeURIComponent(id));
+      if (res.status === 404) return false; // op was cleared; give up now and retry fresh
       if (!res.ok) continue;
       const { status } = await res.json();
       if (status === "done") return true;

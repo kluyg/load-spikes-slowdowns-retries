@@ -51,7 +51,15 @@ Measured (60 qps baseline, 8s spike to 5× capacity, FIFO, no deadline drop):
 | No retry | 1× (3,775 attempts) | queue drains — system recovers |
 | Immediate retry ×5 | **5.3× (18,278 attempts)** | offered stuck at 300–1250/s, queue 5k→15k+, never recovers |
 
-The cure — frontend load shedding and backoff + jitter — is the next pass.
+There's an operator **"Clear queue"** lever that drops the whole backlog
+(orphaned operations then 404 on their next poll, and clients retry fresh). It
+does **not** fix the collapse: the 404'd operations all retry at once — a
+thundering herd that re-saturates the queue within a second or two. That's the
+point — a metastable collapse is sustained by *client* retry behavior, so a
+server-side flush is a band-aid the retry storm tears off.
+
+The real cure — frontend load shedding (where the client treats rejection as
+"stop," not "retry harder") and backoff + jitter — is the next pass.
 
 **Backend knobs** — live-tunable backend behavior that reproduces the
 throughput-vs-goodput dynamics from

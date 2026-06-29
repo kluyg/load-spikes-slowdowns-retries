@@ -48,6 +48,7 @@ const retryStrategyInput = el("retry-strategy");
 const maxRetriesInput = el("max-retries");
 const spikeLoadBtn = el("spike-load");
 const spikeLatencyBtn = el("spike-latency");
+const clearQueueBtn = el("clear-queue");
 
 // Backend-config controls (mirror the Config struct on the server).
 const cfgInputs = {
@@ -146,6 +147,16 @@ function flash(btn) {
   btn.classList.add("active");
   setTimeout(() => btn.classList.remove("active"), SPIKE_MS);
 }
+
+clearQueueBtn.onclick = async () => {
+  try {
+    await fetch("/api/admin/clear-queue", { method: "POST" });
+    clearQueueBtn.classList.add("active");
+    setTimeout(() => clearQueueBtn.classList.remove("active"), 600);
+  } catch (err) {
+    /* ignore */
+  }
+};
 
 // --- Sampling + rendering ---------------------------------------------------
 

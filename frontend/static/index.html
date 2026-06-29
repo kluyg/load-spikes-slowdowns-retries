@@ -61,6 +61,8 @@
     button.stop { background: var(--bad); color: #1a0606; }
     button.chaos { background: #21262d; color: var(--text); border: 1px solid var(--border); }
     button.chaos.active { background: var(--warn); color: #1a1206; border-color: var(--warn); }
+    button.fix { background: transparent; color: var(--good); border: 1px solid var(--good); }
+    button.fix.active { background: var(--good); color: #06210c; }
     .cards {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -106,6 +108,7 @@
         <span class="spacer"></span>
         <button id="spike-load" class="chaos">Spike load 4&times;</button>
         <button id="spike-latency" class="chaos">Spike latency 4&times;</button>
+        <button id="clear-queue" class="fix">Clear queue</button>
       </div>
     </div>
 

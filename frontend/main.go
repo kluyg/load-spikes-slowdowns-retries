@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,9 +46,21 @@ const (
 	latencyUntilKey = "chaos:latency_until_ms"
 	inflightKey     = "metric:inflight"        // durable gauge (we INCR, backend DECRs)
 	throughputKey   = "metric:throughput_total" // durable counter of work done
+	clearEpochKey   = "clear_epoch_ms"          // last operator queue-clear time
 	chaosDuration   = 8 * time.Second
 	sampleInterval  = 250 * time.Millisecond
 )
+
+// clearQueueScript atomically drops the backlog, reconciles the in-flight gauge
+// (the cleared items will never be resolved by the backend), and stamps the
+// clear epoch so GetOperation can 404 the orphaned operations.
+var clearQueueScript = redis.NewScript(`
+local n = redis.call('LLEN', KEYS[1])
+redis.call('DEL', KEYS[1])
+redis.call('DECRBY', KEYS[2], n)
+redis.call('SET', KEYS[3], ARGV[1])
+return n
+`)
 
 type workItem struct {
 	ID         string `json:"id"`
@@ -100,10 +113,11 @@ type metrics struct {
 }
 
 type server struct {
-	rdb    *redis.Client
-	m      metrics
-	cfgPtr atomic.Pointer[Config]
-	done   sync.Map
+	rdb          *redis.Client
+	m            metrics
+	cfgPtr       atomic.Pointer[Config]
+	clearEpochMs atomic.Int64 // ops enqueued before this were cleared -> 404
+	done         sync.Map
 }
 
 func main() {
@@ -128,6 +142,7 @@ func main() {
 	mux.HandleFunc("/api/metrics", s.handleMetrics)
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/chaos/latency", s.handleChaosLatency)
+	mux.HandleFunc("/api/admin/clear-queue", s.handleClearQueue)
 
 	listen := ":" + getenv("PORT", "8080")
 	log.Printf("frontend listening on %s (redis=%s)", listen, addr)
@@ -147,6 +162,9 @@ func (s *server) refreshConfig(ctx context.Context) {
 	for {
 		cfg := s.loadConfig(ctx)
 		s.cfgPtr.Store(&cfg)
+		if ce, err := s.rdb.Get(ctx, clearEpochKey).Int64(); err == nil {
+			s.clearEpochMs.Store(ce)
+		}
 		<-t.C
 	}
 }
@@ -238,8 +256,11 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	deadlineMs, _ := strconv.ParseInt(r.URL.Query().Get("deadline_ms"), 10, 64)
-	id := randHex()
-	item := workItem{ID: id, EnqueuedMs: time.Now().UnixMilli(), DeadlineMs: deadlineMs}
+	nowMs := time.Now().UnixMilli()
+	// The id carries its enqueue time so GetOperation can tell whether an op
+	// predates the last queue clear (and is therefore gone) without any lookup.
+	id := strconv.FormatInt(nowMs, 10) + "-" + randHex()
+	item := workItem{ID: id, EnqueuedMs: nowMs, DeadlineMs: deadlineMs}
 	b, _ := json.Marshal(item)
 	if err := s.rdb.LPush(r.Context(), workQueueKey, b).Err(); err != nil {
 		s.m.rpcFailure.Add(1)
@@ -254,15 +275,50 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 // handleGetOp implements the GetOperation RPC.
 func (s *server) handleGetOp(w http.ResponseWriter, r *http.Request) {
 	s.m.getOp.Add(1)
-	id := r.URL.Query().Get("id")
-	status := "pending"
-	if _, ok := s.done.Load(id); ok {
-		status = "done"
-	} else if v, _ := s.rdb.Get(r.Context(), "op:"+id).Result(); v == "done" {
-		status = "done" // fallback if the pub/sub notification was missed
-	}
 	s.m.rpcSuccess.Add(1)
-	writeJSON(w, map[string]string{"status": status})
+	id := r.URL.Query().Get("id")
+
+	if _, ok := s.done.Load(id); ok {
+		writeJSON(w, map[string]string{"status": "done"})
+		return
+	}
+	if v, _ := s.rdb.Get(r.Context(), "op:"+id).Result(); v == "done" {
+		writeJSON(w, map[string]string{"status": "done"}) // durable fallback
+		return
+	}
+	// Not done. If it was enqueued before the last operator queue-clear, it was
+	// thrown away — tell the client so it can issue a fresh operation.
+	if ce := s.clearEpochMs.Load(); ce > 0 {
+		if ts := opTimestamp(id); ts > 0 && ts < ce {
+			http.Error(w, "operation not found", http.StatusNotFound)
+			return
+		}
+	}
+	writeJSON(w, map[string]string{"status": "pending"})
+}
+
+// opTimestamp extracts the enqueue time encoded as the id's "<ms>-..." prefix.
+func opTimestamp(id string) int64 {
+	if i := strings.IndexByte(id, '-'); i > 0 {
+		if n, err := strconv.ParseInt(id[:i], 10, 64); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// handleClearQueue is the operator "fix it" lever: drop the entire backlog. The
+// orphaned operations will 404 on their next poll, and clients retry fresh.
+func (s *server) handleClearQueue(w http.ResponseWriter, r *http.Request) {
+	now := time.Now().UnixMilli()
+	n, err := clearQueueScript.Run(r.Context(), s.rdb,
+		[]string{workQueueKey, inflightKey, clearEpochKey}, now).Int64()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.clearEpochMs.Store(now)
+	writeJSON(w, map[string]any{"cleared": n})
 }
 
 // handleConfig serves and updates the live knobs.
