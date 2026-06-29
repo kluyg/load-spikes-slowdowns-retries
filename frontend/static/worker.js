@@ -68,11 +68,14 @@ async function runLogicalRequest() {
   self.postMessage({ type: "started" });
   let attempt = 0;
   while (true) {
-    if (await oneAttempt()) {
+    const result = await oneAttempt();
+    if (result === "ok") {
       self.postMessage({ type: "completed" });
       return;
     }
-    if (retryStrategy === "none" || attempt >= maxRetries) {
+    // Honor backpressure: a shed (429) means "stop", not "retry harder". Only
+    // timeouts are retried. This is what lets shedding actually break the storm.
+    if (result === "shed" || retryStrategy === "none" || attempt >= maxRetries) {
       self.postMessage({ type: "failed" });
       return;
     }
@@ -90,15 +93,17 @@ function retryDelay(attempt) {
 }
 
 // oneAttempt makes a single StartWork call and polls until its deadline.
+// Returns "ok" | "timeout" | "shed".
 async function oneAttempt() {
   const deadline = Date.now() + clientDeadlineMs;
   try {
     const res = await fetch("/api/start?deadline_ms=" + deadline, { method: "POST" });
-    if (!res.ok) return false; // rejected at the edge
+    if (res.status === 429) return "shed"; // explicit backpressure
+    if (!res.ok) return "timeout";
     const { operation_id } = await res.json();
-    return await pollUntilDone(operation_id, deadline);
+    return (await pollUntilDone(operation_id, deadline)) ? "ok" : "timeout";
   } catch (err) {
-    return false;
+    return "timeout";
   }
 }
 

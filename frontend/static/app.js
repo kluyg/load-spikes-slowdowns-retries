@@ -52,6 +52,9 @@ const clearQueueBtn = el("clear-queue");
 
 // Backend-config controls (mirror the Config struct on the server).
 const cfgInputs = {
+  shed_mode: el("shed-mode"),
+  max_qps: el("max-qps"),
+  inflight_quota: el("inflight-quota"),
   queue_mode: el("queue-mode"),
   queue_max: el("queue-max"),
   deadline_mode: el("deadline-mode"),
@@ -65,6 +68,9 @@ const cfgInputs = {
 async function loadConfig() {
   try {
     const c = await (await fetch("/api/config")).json();
+    cfgInputs.shed_mode.value = c.shed_mode;
+    cfgInputs.max_qps.value = c.max_qps;
+    cfgInputs.inflight_quota.value = c.inflight_quota;
     cfgInputs.queue_mode.value = c.queue_mode;
     cfgInputs.queue_max.value = c.queue_max;
     cfgInputs.deadline_mode.value = c.deadline_mode;
@@ -78,6 +84,9 @@ async function loadConfig() {
 
 async function postConfig() {
   const body = {
+    shed_mode: cfgInputs.shed_mode.value,
+    max_qps: Number(cfgInputs.max_qps.value),
+    inflight_quota: Number(cfgInputs.inflight_quota.value),
     queue_mode: cfgInputs.queue_mode.value,
     queue_max: Number(cfgInputs.queue_max.value),
     deadline_mode: cfgInputs.deadline_mode.value,

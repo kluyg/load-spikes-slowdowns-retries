@@ -83,10 +83,46 @@ type Config struct {
 	MarginMs     int64  `json:"margin_ms"`
 	LatencyMode  string `json:"latency_mode"`
 	LatencyMs    int64  `json:"latency_ms"`
+	// Frontend load shedding (frontend-only knobs).
+	ShedMode      string `json:"shed_mode"`      // none | qps | inflight
+	MaxQPS        int64  `json:"max_qps"`        // qps mode: shared StartWork+GetOperation budget
+	InflightQuota int64  `json:"inflight_quota"` // inflight mode: cap on admitted work
 }
 
 func defaultConfig() Config {
-	return Config{QueueMode: "FIFO", QueueMax: 0, DeadlineMode: "none", MarginMs: 70, LatencyMode: "uniform", LatencyMs: 50}
+	return Config{
+		QueueMode: "FIFO", QueueMax: 0, DeadlineMode: "none", MarginMs: 70,
+		LatencyMode: "uniform", LatencyMs: 50,
+		ShedMode: "none", MaxQPS: 0, InflightQuota: 0,
+	}
+}
+
+// tokenBucket is a simple shared rate limiter for the fixed-max-QPS shed policy.
+// Burst is one second's worth of tokens. The rate is passed in so it can change
+// live with the config.
+type tokenBucket struct {
+	mu     sync.Mutex
+	tokens float64
+	last   time.Time
+}
+
+func (tb *tokenBucket) allow(rate float64) bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	now := time.Now()
+	if tb.last.IsZero() {
+		tb.last = now
+	}
+	tb.tokens += rate * now.Sub(tb.last).Seconds()
+	tb.last = now
+	if tb.tokens > rate {
+		tb.tokens = rate // cap burst at ~1s
+	}
+	if tb.tokens >= 1 {
+		tb.tokens--
+		return true
+	}
+	return false
 }
 
 // snapshot is the server-side metric sample streamed to the browser. Goodput is
@@ -117,7 +153,22 @@ type server struct {
 	m            metrics
 	cfgPtr       atomic.Pointer[Config]
 	clearEpochMs atomic.Int64 // ops enqueued before this were cleared -> 404
+	bucket       tokenBucket  // shared rate limiter for the qps shed policy
 	done         sync.Map
+}
+
+// shouldShed decides whether to reject an RPC under the current shed policy.
+// The qps budget is shared by both RPCs; the in-flight quota gates only new
+// work (StartWork), so polls for already-admitted work still get through.
+func (s *server) shouldShed(ctx context.Context, cfg Config, isStart bool) bool {
+	switch cfg.ShedMode {
+	case "qps":
+		return cfg.MaxQPS > 0 && !s.bucket.allow(float64(cfg.MaxQPS))
+	case "inflight":
+		return isStart && cfg.InflightQuota > 0 &&
+			getInt(ctx, s.rdb, inflightKey) >= cfg.InflightQuota
+	}
+	return false
 }
 
 func main() {
@@ -184,8 +235,17 @@ func (s *server) loadConfig(ctx context.Context) Config {
 	if v := m["latency_mode"]; v != "" {
 		c.LatencyMode = v
 	}
+	if v := m["shed_mode"]; v != "" {
+		c.ShedMode = v
+	}
 	if n, err := strconv.ParseInt(m["queue_max"], 10, 64); err == nil {
 		c.QueueMax = n
+	}
+	if n, err := strconv.ParseInt(m["max_qps"], 10, 64); err == nil {
+		c.MaxQPS = n
+	}
+	if n, err := strconv.ParseInt(m["inflight_quota"], 10, 64); err == nil {
+		c.InflightQuota = n
 	}
 	if n, err := strconv.ParseInt(m["margin_ms"], 10, 64); err == nil {
 		c.MarginMs = n
@@ -244,9 +304,17 @@ func (s *server) runSampler(ctx context.Context) {
 // handleStart implements the StartWork RPC.
 func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 	s.m.startWork.Add(1)
+	cfg := s.currentConfig()
+
+	// Load shedding: reject excess at the front door, cheaply, before any work
+	// is enqueued. The client treats 429 as backpressure and does not retry.
+	if s.shouldShed(r.Context(), cfg, true) {
+		s.m.rpcFailure.Add(1)
+		http.Error(w, "shed", http.StatusTooManyRequests)
+		return
+	}
 
 	// Queue-max knob: reject when the backlog is full (enqueue-time shedding).
-	cfg := s.currentConfig()
 	if cfg.QueueMax > 0 {
 		if n, _ := s.rdb.LLen(r.Context(), workQueueKey).Result(); n >= cfg.QueueMax {
 			s.m.rpcFailure.Add(1)
@@ -275,6 +343,11 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 // handleGetOp implements the GetOperation RPC.
 func (s *server) handleGetOp(w http.ResponseWriter, r *http.Request) {
 	s.m.getOp.Add(1)
+	if s.shouldShed(r.Context(), s.currentConfig(), false) {
+		s.m.rpcFailure.Add(1)
+		http.Error(w, "shed", http.StatusTooManyRequests)
+		return
+	}
 	s.m.rpcSuccess.Add(1)
 	id := r.URL.Query().Get("id")
 
@@ -337,8 +410,11 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"queue_max":     c.QueueMax,
 		"deadline_mode": c.DeadlineMode,
 		"margin_ms":     c.MarginMs,
-		"latency_mode":  c.LatencyMode,
-		"latency_ms":    c.LatencyMs,
+		"latency_mode":   c.LatencyMode,
+		"latency_ms":     c.LatencyMs,
+		"shed_mode":      c.ShedMode,
+		"max_qps":        c.MaxQPS,
+		"inflight_quota": c.InflightQuota,
 	}).Err(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

@@ -113,6 +113,22 @@
     </div>
 
     <div class="panel">
+      <h2>Frontend &mdash; load shedding</h2>
+      <div class="row">
+        <label>Shed mode
+          <select id="shed-mode">
+            <option value="none">None</option>
+            <option value="qps">Fixed max QPS (shared)</option>
+            <option value="inflight">In-flight quota</option>
+          </select>
+        </label>
+        <label>Max QPS <input id="max-qps" type="number" value="0" min="0" /></label>
+        <label>In-flight quota <input id="inflight-quota" type="number" value="0" min="0" /></label>
+        <span style="color:var(--muted)">capacity &approx; 80 ops/s</span>
+      </div>
+    </div>
+
+    <div class="panel">
       <h2>Backend parameters</h2>
       <div class="row">
         <label>Queue strategy

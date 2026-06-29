@@ -58,8 +58,26 @@ thundering herd that re-saturates the queue within a second or two. That's the
 point — a metastable collapse is sustained by *client* retry behavior, so a
 server-side flush is a band-aid the retry storm tears off.
 
-The real cure — frontend load shedding (where the client treats rejection as
-"stop," not "retry harder") and backoff + jitter — is the next pass.
+**Load shedding — the cure** — the frontend can shed load (none / fixed max QPS
+shared across both RPCs / in-flight quota), returning **429**. Crucially the
+client treats a 429 as backpressure — it gives up rather than retrying — so
+shedding both protects the backend *and* stops the retry storm from forming.
+
+Same immediate-retry spike as above, with an in-flight quota of 70:
+
+| | Shedding off | In-flight quota = 70 |
+|---|---|---|
+| Queue during spike | explodes → 13,800+ | pinned at 70 |
+| Goodput during spike | 0 | ~78/s (≈ capacity) |
+| After the spike | collapsed indefinitely | drains, recovers in ~3s |
+| Offered amplification | 5.25× | 1× (no retry storm) |
+| Total goodput | 12% | 59% |
+
+The full arc: backend knobs → retries cause a metastable collapse → clearing the
+queue can't fix it → load shedding with a well-behaved client does.
+
+Still to come: backoff + jitter as a client-side mitigation, and one-click
+scenario presets.
 
 **Backend knobs** — live-tunable backend behavior that reproduces the
 throughput-vs-goodput dynamics from
