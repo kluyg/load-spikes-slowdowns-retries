@@ -3,17 +3,19 @@
 //
 //	POST /api/start          StartWork    — enqueue a work item, return an op id
 //	GET  /api/op?id=         GetOperation — report whether that op has completed
-//	GET  /api/stream         SSE stream of server-side metrics
-//	GET  /api/config         current live knobs
-//	POST /api/config         update live knobs (stored in a Redis hash)
-//	POST /api/chaos/latency  trigger a short 4x backend-latency spike
+//	GET  /api/stream             SSE stream of server-side metrics
+//	GET  /api/metrics            latest metric snapshot as JSON
+//	GET  /api/config             current live knobs
+//	POST /api/config             update live knobs (stored in a Redis hash)
+//	POST /api/chaos/latency      trigger a short 4x backend-latency spike
+//	POST /api/admin/clear-queue  operator lever: drop the whole backlog
 //
 // Completions are learned by subscribing to the Redis pub/sub channel the
 // backend publishes to (the "message queue").
 //
-// Phase 2a (backend knobs): the frontend owns the "queue max size" knob (it
-// rejects StartWork when the queue is full) and propagates each client's
-// deadline into the work item. Load shedding and client retries arrive later.
+// The frontend applies load shedding (fixed max QPS or in-flight quota),
+// enforces the queue-max limit, and propagates each client's deadline into the
+// work item.
 package main
 
 import (

@@ -2,12 +2,12 @@
 // doing the work, and publishes a completion notification so the frontend can
 // answer GetOperation calls.
 //
-// Phase 2a (backend knobs) — live-tunable via a Redis config hash:
+// Its behavior is live-tunable via a Redis config hash:
 //   - queue discipline:  FIFO (serve oldest) vs LIFO (serve newest)
 //   - deadline propagation: none / drop-if-expired / drop-if-no-margin
 //   - latency distribution: uniform vs long-tail (mean-preserving lognormal)
 //
-// Plus the short-lived 4x latency spike from Phase 1. This reproduces the
+// It also honors a short-lived 4x latency spike. This reproduces the
 // dynamics from https://strebkov.dev/posts/shed-your-load/ : under overload,
 // FIFO serves work whose clients already gave up (throughput stays flat, goodput
 // collapses), LIFO serves the freshest work, and a deadline margin refuses work
