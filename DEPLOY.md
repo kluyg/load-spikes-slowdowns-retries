@@ -1,8 +1,7 @@
 # Deploying a durable public instance (DigitalOcean + Tailscale Funnel)
 
 The laptop-served Funnel URL is only live while your machine is awake. For a
-submission link that's reliably up, run the same compose on a small always-on
-Droplet. Tailscale Funnel gives free HTTPS and needs **no inbound ports** open
+durable public link, run the same compose on a small always-on Droplet. Tailscale Funnel gives free HTTPS and needs **no inbound ports** open
 (ingress arrives over Tailscale's own connection), so the box's only exposed
 port is SSH.
 
@@ -11,7 +10,7 @@ port is SSH.
 - **Image:** Ubuntu 24.04 (LTS) x64
 - **Plan:** Basic → Regular → **$6/mo (1 GB / 1 vCPU)**. 1 GB matters only so the
   in-VM Go build doesn't OOM; the running stack uses far less.
-- **Region:** closest to you (or to the reviewers).
+- **Region:** closest to you (or to your users).
 - **Auth:** add your SSH key.
 - Create, and note the Droplet's IP.
 

@@ -31,7 +31,7 @@ services:
   # It serves the frontend on your tailnet (https://frontend.<tailnet>.ts.net) by
   # proxying to the frontend service over the Docker network. Needs TS_AUTHKEY in
   # a (gitignored) .env file. The default `docker compose up` runs the plain local
-  # stack with no key required, so a reviewer can always run it.
+  # stack with no key required, so anyone can run it.
   ts-frontend:
     image: tailscale/tailscale:latest
     profiles: ["tailnet"]
