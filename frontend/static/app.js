@@ -224,18 +224,20 @@ function drawChart(canvas, series, unit) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
 
-  // Plot area: leave gutters for the y-axis labels (left) and time axis (bottom).
-  const padL = 44, padR = 6, padT = 6, padB = 16;
-  const plotW = w - padL - padR;
-  const plotH = h - padT - padB;
-
   let rawMax = 10;
   series.forEach((s) => s.data.forEach((v) => (rawMax = Math.max(rawMax, v))));
   const max = niceCeil(rawMax);
-  const stepX = plotW / 59;
-  const scaleY = plotH / max;
 
   ctx.font = "10px -apple-system, 'Segoe UI', sans-serif";
+
+  // Plot area: size the left gutter to the widest y label so it never clips.
+  const topLabel = `${max} ${unit}`;
+  const padL = Math.ceil(ctx.measureText(topLabel).width) + 10;
+  const padR = 6, padT = 6, padB = 16;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+  const stepX = plotW / 59;
+  const scaleY = plotH / max;
 
   // Y axis: gridlines + tick labels at 0 / half / max, unit on the top tick.
   ctx.textAlign = "right";
