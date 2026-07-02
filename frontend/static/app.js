@@ -192,8 +192,8 @@ function render(goodput) {
   drawChart(mainCanvas, [
     { data: tputHistory, color: "#58a6ff" },
     { data: goodputHistory, color: "#3fb950" },
-  ]);
-  drawChart(queueCanvas, [{ data: queueHistory, color: "#d29922" }]);
+  ], "ops/s");
+  drawChart(queueCanvas, [{ data: queueHistory, color: "#d29922" }], "items");
 }
 
 function setText(id, value) {
@@ -205,7 +205,16 @@ function setText(id, value) {
 const mainCanvas = el("main-chart");
 const queueCanvas = el("queue-chart");
 
-function drawChart(canvas, series) {
+// niceCeil rounds up to a 1/2/5 x 10^n value so axis ticks land on round numbers.
+function niceCeil(v) {
+  const pow = 10 ** Math.floor(Math.log10(v));
+  for (const m of [1, 2, 5, 10]) {
+    if (m * pow >= v) return m * pow;
+  }
+  return 10 * pow;
+}
+
+function drawChart(canvas, series, unit) {
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth;
@@ -215,25 +224,63 @@ function drawChart(canvas, series) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
 
-  const pad = 4;
-  let max = 10;
-  series.forEach((s) => s.data.forEach((v) => (max = Math.max(max, v))));
-  const stepX = (w - pad * 2) / 59;
-  const scaleY = (h - pad * 2) / max;
+  // Plot area: leave gutters for the y-axis labels (left) and time axis (bottom).
+  const padL = 44, padR = 6, padT = 6, padB = 16;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+
+  let rawMax = 10;
+  series.forEach((s) => s.data.forEach((v) => (rawMax = Math.max(rawMax, v))));
+  const max = niceCeil(rawMax);
+  const stepX = plotW / 59;
+  const scaleY = plotH / max;
+
+  ctx.font = "10px -apple-system, 'Segoe UI', sans-serif";
+
+  // Y axis: gridlines + tick labels at 0 / half / max, unit on the top tick.
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  [0, max / 2, max].forEach((v) => {
+    const y = padT + plotH - v * scaleY;
+    ctx.strokeStyle = "#262d38";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(w - padR, y);
+    ctx.stroke();
+    ctx.fillStyle = "#8b95a4";
+    const label = v === max ? `${v} ${unit}` : `${v}`;
+    ctx.fillText(label, padL - 5, Math.max(y, padT + 5));
+  });
+
+  // X axis: time, oldest sample on the left.
+  ctx.textBaseline = "top";
+  const xTicks = [
+    { i: 0, label: "-60s", align: "left" },
+    { i: 30, label: "-30s", align: "center" },
+    { i: 59, label: "now", align: "right" },
+  ];
+  ctx.fillStyle = "#8b95a4";
+  xTicks.forEach((t) => {
+    ctx.textAlign = t.align;
+    ctx.fillText(t.label, padL + t.i * stepX, padT + plotH + 4);
+  });
 
   series.forEach((s) => {
     if (s.data.length < 2) return;
+    // Newest sample pinned at the right edge; the series grows in from the right.
+    const offset = 60 - s.data.length;
     ctx.beginPath();
     s.data.forEach((v, i) => {
-      const x = pad + i * stepX;
-      const y = h - pad - v * scaleY;
+      const x = padL + (offset + i) * stepX;
+      const y = padT + plotH - v * scaleY;
       i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
     });
     ctx.strokeStyle = s.color;
     ctx.lineWidth = 2;
     ctx.stroke();
-    ctx.lineTo(pad + (s.data.length - 1) * stepX, h - pad);
-    ctx.lineTo(pad, h - pad);
+    ctx.lineTo(padL + 59 * stepX, padT + plotH);
+    ctx.lineTo(padL + offset * stepX, padT + plotH);
     ctx.closePath();
     ctx.fillStyle = s.color + "1f"; // ~12% alpha
     ctx.fill();
