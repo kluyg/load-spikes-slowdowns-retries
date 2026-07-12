@@ -74,6 +74,15 @@ Prints the public URL. Open it from a phone on cellular (off any tailnet) to
 confirm it's truly public. `restart: unless-stopped` keeps the stack up across
 reboots.
 
+## Multiple concurrent users
+
+The public link is safe to share: each visitor gets an isolated room (its own
+queue, config, graphs, and a dedicated backend worker pool), so people driving
+it at the same time don't interfere. Cost scales with the number of *live*
+rooms — each is a handful of goroutines and a few small Redis keys, and idle
+rooms are torn down automatically — so the $6 Droplet comfortably handles a
+classroom's worth of simultaneous tabs.
+
 ## Teardown
 
 ```sh

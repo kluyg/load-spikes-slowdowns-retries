@@ -5,6 +5,7 @@
 // load counts attempts — and the gap between them is how retries manufacture new
 // load during overload (the metastable trap).
 
+let room = ""; // isolates this client's RPCs to its own room; set via config
 let baseQps = 60;
 let clientDeadlineMs = 1000;
 let retryStrategy = "none"; // none | immediate | backoff | jitter
@@ -20,6 +21,7 @@ self.onmessage = (e) => {
   const msg = e.data;
   switch (msg.type) {
     case "config":
+      if (msg.room != null) room = msg.room;
       if (msg.qps != null) baseQps = msg.qps;
       if (msg.clientDeadlineMs != null) clientDeadlineMs = msg.clientDeadlineMs;
       if (msg.retryStrategy != null) retryStrategy = msg.retryStrategy;
@@ -97,7 +99,7 @@ function retryDelay(attempt) {
 async function oneAttempt() {
   const deadline = Date.now() + clientDeadlineMs;
   try {
-    const res = await fetch("/api/start?deadline_ms=" + deadline, { method: "POST" });
+    const res = await fetch("/api/start?deadline_ms=" + deadline + "&room=" + room, { method: "POST" });
     if (res.status === 429) return "shed"; // explicit backpressure
     if (!res.ok) return "timeout";
     const { operation_id } = await res.json();
@@ -111,7 +113,7 @@ async function pollUntilDone(id, deadline) {
   while (Date.now() < deadline) {
     await sleep(POLL_INTERVAL_MS);
     try {
-      const res = await fetch("/api/op?id=" + encodeURIComponent(id));
+      const res = await fetch("/api/op?id=" + encodeURIComponent(id) + "&room=" + room);
       if (res.status === 404) return false; // op was cleared; give up now and retry fresh
       if (!res.ok) continue;
       const { status } = await res.json();

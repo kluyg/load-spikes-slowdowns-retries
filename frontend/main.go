@@ -10,8 +10,18 @@
 //	POST /api/chaos/latency      trigger a short 4x backend-latency spike
 //	POST /api/admin/clear-queue  operator lever: drop the whole backlog
 //
-// Completions are learned by subscribing to the Redis pub/sub channel the
-// backend publishes to (the "message queue").
+// Every request carries a `room` id, and each room is fully isolated: its own
+// work queue, config, metrics, completion bus, and (in the backend) its own
+// worker pool. This is what lets two people drive the deployed system at once
+// without their graphs — or their capacity — bleeding together. All of a room's
+// state lives under Redis keys prefixed "room:<id>:", and per-room in-process
+// state (request counters, config cache, token bucket, seen completions) lives
+// in a roomState looked up by id.
+//
+// A room is kept alive by touching the `rooms` sorted set on every request and
+// on each metric-stream tick; a janitor deletes an idle room's keys, and the
+// backend tears down its pool. Completions are learned by pattern-subscribing to
+// every room's pub/sub channel.
 //
 // The frontend applies load shedding (fixed max QPS or in-flight quota),
 // enforces the queue-max limit, and propagates each client's deadline into the
@@ -29,6 +39,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,16 +53,20 @@ import (
 var staticFS embed.FS
 
 const (
-	workQueueKey    = "work:queue"
-	completionChan  = "completions"
-	configKey       = "config"
-	latencyUntilKey = "chaos:latency_until_ms"
-	inflightKey     = "metric:inflight"        // durable gauge (we INCR, backend DECRs)
-	throughputKey   = "metric:throughput_total" // durable counter of work done
-	clearEpochKey   = "clear_epoch_ms"          // last operator queue-clear time
-	chaosDuration   = 8 * time.Second
-	sampleInterval  = 250 * time.Millisecond
+	roomsKey       = "rooms" // ZSET: room id -> last-activity unix ms
+	chaosDuration  = 8 * time.Second
+	sampleInterval = 250 * time.Millisecond
+	// An idle room's keys are deleted roomIdleGC after its last activity. This
+	// is longer than the backend's roomIdleStop so a room's workers are gone
+	// before we delete the keys they might otherwise write to.
+	roomIdleGC = 20 * time.Second
 )
+
+// roomRe bounds room ids so they're safe to splice into Redis keys.
+var roomRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// roomKey builds the Redis key for a per-room datum, matching the backend.
+func roomKey(room, name string) string { return "room:" + room + ":" + name }
 
 // clearQueueScript atomically drops the backlog, reconciles the in-flight gauge
 // (the cleared items will never be resolved by the backend), and stamps the
@@ -140,8 +155,9 @@ type snapshot struct {
 	TsMs         int64   `json:"ts_ms"`
 }
 
-// metrics holds frontend-local request counters. In-flight and throughput live
-// in Redis (durable counters) rather than here, so they survive pub/sub loss.
+// metrics holds a room's frontend-local request counters. In-flight and
+// throughput live in Redis (durable counters) rather than here, so they survive
+// pub/sub loss.
 type metrics struct {
 	startWork  atomic.Int64
 	getOp      atomic.Int64
@@ -150,25 +166,75 @@ type metrics struct {
 	latest     atomic.Pointer[snapshot]
 }
 
-type server struct {
-	rdb          *redis.Client
+// roomState is one room's isolated in-process state. Everything here is scoped
+// to a single room id; a room never sees another's counters, config, or bucket.
+type roomState struct {
 	m            metrics
 	cfgPtr       atomic.Pointer[Config]
 	clearEpochMs atomic.Int64 // ops enqueued before this were cleared -> 404
-	bucket       tokenBucket  // shared rate limiter for the qps shed policy
-	done         sync.Map
+	bucket       tokenBucket  // rate limiter for this room's qps shed policy
+	done         sync.Map     // completion fast-path (op id -> struct{})
+
+	// sampler's previous cumulative values, for per-interval rates. Only the
+	// sampler goroutine touches these, so they need no synchronization.
+	lsw, lgo, lok, lerr, ldone int64
 }
 
-// shouldShed decides whether to reject an RPC under the current shed policy.
+type server struct {
+	rdb   *redis.Client
+	mu    sync.Mutex
+	rooms map[string]*roomState
+}
+
+// roomState returns the room's state, creating it (with default config) on first
+// use. Safe for concurrent callers.
+func (s *server) roomState(room string) *roomState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rs := s.rooms[room]
+	if rs == nil {
+		rs = &roomState{}
+		c := defaultConfig()
+		rs.cfgPtr.Store(&c)
+		s.rooms[room] = rs
+	}
+	return rs
+}
+
+func (rs *roomState) config() Config {
+	if c := rs.cfgPtr.Load(); c != nil {
+		return *c
+	}
+	return defaultConfig()
+}
+
+// roomParam validates and returns the request's room id, writing a 400 if it's
+// missing or malformed.
+func (s *server) roomParam(w http.ResponseWriter, r *http.Request) (string, bool) {
+	room := r.URL.Query().Get("room")
+	if !roomRe.MatchString(room) {
+		http.Error(w, "missing or invalid room", http.StatusBadRequest)
+		return "", false
+	}
+	return room, true
+}
+
+// touch marks a room active so the backend keeps its pool up and the janitor
+// leaves its keys alone.
+func (s *server) touch(ctx context.Context, room string) {
+	s.rdb.ZAdd(ctx, roomsKey, redis.Z{Score: float64(time.Now().UnixMilli()), Member: room})
+}
+
+// shouldShed decides whether to reject an RPC under the room's shed policy.
 // The qps budget is shared by both RPCs; the in-flight quota gates only new
 // work (StartWork), so polls for already-admitted work still get through.
-func (s *server) shouldShed(ctx context.Context, cfg Config, isStart bool) bool {
+func (s *server) shouldShed(ctx context.Context, room string, rs *roomState, cfg Config, isStart bool) bool {
 	switch cfg.ShedMode {
 	case "qps":
-		return cfg.MaxQPS > 0 && !s.bucket.allow(float64(cfg.MaxQPS))
+		return cfg.MaxQPS > 0 && !rs.bucket.allow(float64(cfg.MaxQPS))
 	case "inflight":
 		return isStart && cfg.InflightQuota > 0 &&
-			getInt(ctx, s.rdb, inflightKey) >= cfg.InflightQuota
+			getInt(ctx, s.rdb, roomKey(room, "metric:inflight")) >= cfg.InflightQuota
 	}
 	return false
 }
@@ -176,11 +242,12 @@ func (s *server) shouldShed(ctx context.Context, cfg Config, isStart bool) bool 
 func main() {
 	addr := getenv("REDIS_ADDR", "localhost:6379")
 	rdb := redis.NewClient(&redis.Options{Addr: addr})
-	s := &server{rdb: rdb}
+	s := &server{rdb: rdb, rooms: map[string]*roomState{}}
 
 	go s.subscribeCompletions(context.Background())
 	go s.runSampler(context.Background())
 	go s.refreshConfig(context.Background())
+	go s.gcRooms(context.Background())
 
 	static, err := fs.Sub(staticFS, "static")
 	if err != nil {
@@ -202,29 +269,34 @@ func main() {
 	log.Fatal(http.ListenAndServe(listen, mux))
 }
 
-func (s *server) currentConfig() Config {
-	if c := s.cfgPtr.Load(); c != nil {
-		return *c
+// activeRooms returns a snapshot of the tracked rooms for background sweeps.
+func (s *server) activeRooms() map[string]*roomState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]*roomState, len(s.rooms))
+	for k, v := range s.rooms {
+		out[k] = v
 	}
-	return defaultConfig()
+	return out
 }
 
 func (s *server) refreshConfig(ctx context.Context) {
 	t := time.NewTicker(250 * time.Millisecond)
 	defer t.Stop()
-	for {
-		cfg := s.loadConfig(ctx)
-		s.cfgPtr.Store(&cfg)
-		if ce, err := s.rdb.Get(ctx, clearEpochKey).Int64(); err == nil {
-			s.clearEpochMs.Store(ce)
+	for range t.C {
+		for room, rs := range s.activeRooms() {
+			cfg := s.loadConfig(ctx, room)
+			rs.cfgPtr.Store(&cfg)
+			if ce, err := s.rdb.Get(ctx, roomKey(room, "clear_epoch_ms")).Int64(); err == nil {
+				rs.clearEpochMs.Store(ce)
+			}
 		}
-		<-t.C
 	}
 }
 
-func (s *server) loadConfig(ctx context.Context) Config {
+func (s *server) loadConfig(ctx context.Context, room string) Config {
 	c := defaultConfig()
-	m, err := s.rdb.HGetAll(ctx, configKey).Result()
+	m, err := s.rdb.HGetAll(ctx, roomKey(room, "config")).Result()
 	if err != nil {
 		return c
 	}
@@ -259,67 +331,130 @@ func (s *server) loadConfig(ctx context.Context) Config {
 }
 
 // subscribeCompletions feeds only the GetOperation fast-path. Pub/sub is
-// at-most-once, so it is never used as a source of truth: the durable "op:<id>"
-// SET (checked as a fallback in GetOperation) and the Redis metric counters are.
+// at-most-once, so it is never used as a source of truth: the durable
+// "room:<id>:op:<id>" SET (checked as a fallback in GetOperation) and the Redis
+// metric counters are. One pattern subscription covers every room's channel.
 func (s *server) subscribeCompletions(ctx context.Context) {
-	sub := s.rdb.Subscribe(ctx, completionChan)
+	sub := s.rdb.PSubscribe(ctx, "room:*:completions")
 	for msg := range sub.Channel() {
+		room := roomFromChannel(msg.Channel)
+		if room == "" {
+			continue
+		}
 		var c completion
 		if err := json.Unmarshal([]byte(msg.Payload), &c); err != nil {
 			continue
 		}
-		if c.Status == "done" {
-			s.done.Store(c.ID, struct{}{})
+		if c.Status != "done" {
+			continue
+		}
+		// Only record for rooms we're actively tracking; don't resurrect a
+		// GC'd room from a late completion.
+		s.mu.Lock()
+		rs := s.rooms[room]
+		s.mu.Unlock()
+		if rs != nil {
+			rs.done.Store(c.ID, struct{}{})
 		}
 	}
 }
 
+// roomFromChannel pulls "<id>" out of "room:<id>:completions".
+func roomFromChannel(ch string) string {
+	const pre, suf = "room:", ":completions"
+	if strings.HasPrefix(ch, pre) && strings.HasSuffix(ch, suf) {
+		return ch[len(pre) : len(ch)-len(suf)]
+	}
+	return ""
+}
+
+// runSampler computes a fresh per-room metric snapshot every interval. It walks
+// only the rooms the frontend is tracking, so cost scales with live rooms.
 func (s *server) runSampler(ctx context.Context) {
 	t := time.NewTicker(sampleInterval)
 	defer t.Stop()
 	dt := sampleInterval.Seconds()
-	var lsw, lgo, lok, lerr, ldone int64
 	for range t.C {
-		sw, gop := s.m.startWork.Load(), s.m.getOp.Load()
-		ok, er := s.m.rpcSuccess.Load(), s.m.rpcFailure.Load()
-		qlen, _ := s.rdb.LLen(ctx, workQueueKey).Result()
-		// Durable gauge + counter (immune to pub/sub loss).
-		done := getInt(ctx, s.rdb, throughputKey)
-		inflight := getInt(ctx, s.rdb, inflightKey)
-		if inflight < 0 {
-			inflight = 0
+		for room, rs := range s.activeRooms() {
+			sw, gop := rs.m.startWork.Load(), rs.m.getOp.Load()
+			ok, er := rs.m.rpcSuccess.Load(), rs.m.rpcFailure.Load()
+			qlen, _ := s.rdb.LLen(ctx, roomKey(room, "work:queue")).Result()
+			// Durable gauge + counter (immune to pub/sub loss).
+			done := getInt(ctx, s.rdb, roomKey(room, "metric:throughput_total"))
+			inflight := getInt(ctx, s.rdb, roomKey(room, "metric:inflight"))
+			if inflight < 0 {
+				inflight = 0
+			}
+			rs.m.latest.Store(&snapshot{
+				StartWorkQPS: float64(sw-rs.lsw) / dt,
+				GetOpQPS:     float64(gop-rs.lgo) / dt,
+				RPCSuccessPS: float64(ok-rs.lok) / dt,
+				RPCFailurePS: float64(er-rs.lerr) / dt,
+				ThroughputPS: float64(done-rs.ldone) / dt,
+				InFlight:     inflight,
+				QueueLen:     qlen,
+				TsMs:         time.Now().UnixMilli(),
+			})
+			rs.lsw, rs.lgo, rs.lok, rs.lerr, rs.ldone = sw, gop, ok, er, done
 		}
-		s.m.latest.Store(&snapshot{
-			StartWorkQPS: float64(sw-lsw) / dt,
-			GetOpQPS:     float64(gop-lgo) / dt,
-			RPCSuccessPS: float64(ok-lok) / dt,
-			RPCFailurePS: float64(er-lerr) / dt,
-			ThroughputPS: float64(done-ldone) / dt,
-			InFlight:     inflight,
-			QueueLen:     qlen,
-			TsMs:         time.Now().UnixMilli(),
-		})
-		lsw, lgo, lok, lerr, ldone = sw, gop, ok, er, done
+	}
+}
+
+// gcRooms deletes the keys of rooms that have gone idle and drops their
+// in-process state. The backend has already stopped their workers by now (its
+// idle window is shorter), so nothing is racing to rewrite these keys.
+func (s *server) gcRooms(ctx context.Context) {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		cutoff := time.Now().Add(-roomIdleGC).UnixMilli()
+		stale, err := s.rdb.ZRangeByScore(ctx, roomsKey, &redis.ZRangeBy{
+			Min: "-inf",
+			Max: "(" + strconv.FormatInt(cutoff, 10),
+		}).Result()
+		if err != nil {
+			continue
+		}
+		for _, room := range stale {
+			s.rdb.ZRem(ctx, roomsKey, room)
+			s.rdb.Del(ctx,
+				roomKey(room, "work:queue"),
+				roomKey(room, "config"),
+				roomKey(room, "metric:inflight"),
+				roomKey(room, "metric:throughput_total"),
+				roomKey(room, "chaos:latency_until_ms"),
+				roomKey(room, "clear_epoch_ms"),
+			)
+			s.mu.Lock()
+			delete(s.rooms, room)
+			s.mu.Unlock()
+		}
 	}
 }
 
 // handleStart implements the StartWork RPC.
 func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
-	s.m.startWork.Add(1)
-	cfg := s.currentConfig()
+	room, ok := s.roomParam(w, r)
+	if !ok {
+		return
+	}
+	s.touch(r.Context(), room)
+	rs := s.roomState(room)
+	rs.m.startWork.Add(1)
+	cfg := rs.config()
 
 	// Load shedding: reject excess at the front door, cheaply, before any work
 	// is enqueued. The client treats 429 as backpressure and does not retry.
-	if s.shouldShed(r.Context(), cfg, true) {
-		s.m.rpcFailure.Add(1)
+	if s.shouldShed(r.Context(), room, rs, cfg, true) {
+		rs.m.rpcFailure.Add(1)
 		http.Error(w, "shed", http.StatusTooManyRequests)
 		return
 	}
 
 	// Queue-max knob: reject when the backlog is full (enqueue-time shedding).
 	if cfg.QueueMax > 0 {
-		if n, _ := s.rdb.LLen(r.Context(), workQueueKey).Result(); n >= cfg.QueueMax {
-			s.m.rpcFailure.Add(1)
+		if n, _ := s.rdb.LLen(r.Context(), roomKey(room, "work:queue")).Result(); n >= cfg.QueueMax {
+			rs.m.rpcFailure.Add(1)
 			http.Error(w, "queue full", http.StatusServiceUnavailable)
 			return
 		}
@@ -332,38 +467,44 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 	id := strconv.FormatInt(nowMs, 10) + "-" + randHex()
 	item := workItem{ID: id, EnqueuedMs: nowMs, DeadlineMs: deadlineMs}
 	b, _ := json.Marshal(item)
-	if err := s.rdb.LPush(r.Context(), workQueueKey, b).Err(); err != nil {
-		s.m.rpcFailure.Add(1)
+	if err := s.rdb.LPush(r.Context(), roomKey(room, "work:queue"), b).Err(); err != nil {
+		rs.m.rpcFailure.Add(1)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.m.rpcSuccess.Add(1)
-	s.rdb.Incr(r.Context(), inflightKey) // durable in-flight gauge; backend DECRs on resolve
+	rs.m.rpcSuccess.Add(1)
+	s.rdb.Incr(r.Context(), roomKey(room, "metric:inflight")) // durable in-flight gauge; backend DECRs on resolve
 	writeJSON(w, map[string]string{"operation_id": id})
 }
 
 // handleGetOp implements the GetOperation RPC.
 func (s *server) handleGetOp(w http.ResponseWriter, r *http.Request) {
-	s.m.getOp.Add(1)
-	if s.shouldShed(r.Context(), s.currentConfig(), false) {
-		s.m.rpcFailure.Add(1)
+	room, ok := s.roomParam(w, r)
+	if !ok {
+		return
+	}
+	s.touch(r.Context(), room)
+	rs := s.roomState(room)
+	rs.m.getOp.Add(1)
+	if s.shouldShed(r.Context(), room, rs, rs.config(), false) {
+		rs.m.rpcFailure.Add(1)
 		http.Error(w, "shed", http.StatusTooManyRequests)
 		return
 	}
-	s.m.rpcSuccess.Add(1)
+	rs.m.rpcSuccess.Add(1)
 	id := r.URL.Query().Get("id")
 
-	if _, ok := s.done.Load(id); ok {
+	if _, ok := rs.done.Load(id); ok {
 		writeJSON(w, map[string]string{"status": "done"})
 		return
 	}
-	if v, _ := s.rdb.Get(r.Context(), "op:"+id).Result(); v == "done" {
+	if v, _ := s.rdb.Get(r.Context(), roomKey(room, "op:"+id)).Result(); v == "done" {
 		writeJSON(w, map[string]string{"status": "done"}) // durable fallback
 		return
 	}
 	// Not done. If it was enqueued before the last operator queue-clear, it was
 	// thrown away — tell the client so it can issue a fresh operation.
-	if ce := s.clearEpochMs.Load(); ce > 0 {
+	if ce := rs.clearEpochMs.Load(); ce > 0 {
 		if ts := opTimestamp(id); ts > 0 && ts < ce {
 			http.Error(w, "operation not found", http.StatusNotFound)
 			return
@@ -385,21 +526,36 @@ func opTimestamp(id string) int64 {
 // handleClearQueue is the operator "fix it" lever: drop the entire backlog. The
 // orphaned operations will 404 on their next poll, and clients retry fresh.
 func (s *server) handleClearQueue(w http.ResponseWriter, r *http.Request) {
+	room, ok := s.roomParam(w, r)
+	if !ok {
+		return
+	}
+	s.touch(r.Context(), room)
+	rs := s.roomState(room)
 	now := time.Now().UnixMilli()
-	n, err := clearQueueScript.Run(r.Context(), s.rdb,
-		[]string{workQueueKey, inflightKey, clearEpochKey}, now).Int64()
+	n, err := clearQueueScript.Run(r.Context(), s.rdb, []string{
+		roomKey(room, "work:queue"),
+		roomKey(room, "metric:inflight"),
+		roomKey(room, "clear_epoch_ms"),
+	}, now).Int64()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.clearEpochMs.Store(now)
+	rs.clearEpochMs.Store(now)
 	writeJSON(w, map[string]any{"cleared": n})
 }
 
-// handleConfig serves and updates the live knobs.
+// handleConfig serves and updates a room's live knobs.
 func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	room, ok := s.roomParam(w, r)
+	if !ok {
+		return
+	}
+	s.touch(r.Context(), room)
+	rs := s.roomState(room)
 	if r.Method == http.MethodGet {
-		writeJSON(w, s.currentConfig())
+		writeJSON(w, rs.config())
 		return
 	}
 	var c Config
@@ -407,11 +563,11 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.rdb.HSet(r.Context(), configKey, map[string]any{
-		"queue_mode":    c.QueueMode,
-		"queue_max":     c.QueueMax,
-		"deadline_mode": c.DeadlineMode,
-		"margin_ms":     c.MarginMs,
+	if err := s.rdb.HSet(r.Context(), roomKey(room, "config"), map[string]any{
+		"queue_mode":     c.QueueMode,
+		"queue_max":      c.QueueMax,
+		"deadline_mode":  c.DeadlineMode,
+		"margin_ms":      c.MarginMs,
 		"latency_mode":   c.LatencyMode,
 		"latency_ms":     c.LatencyMs,
 		"shed_mode":      c.ShedMode,
@@ -421,13 +577,19 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.cfgPtr.Store(&c) // reflect immediately; refresher keeps it in sync
+	rs.cfgPtr.Store(&c) // reflect immediately; refresher keeps it in sync
 	writeJSON(w, c)
 }
 
-// handleMetrics returns the latest snapshot as plain JSON (handy for scripting).
+// handleMetrics returns the room's latest snapshot as plain JSON (handy for
+// scripting).
 func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	if snap := s.m.latest.Load(); snap != nil {
+	room, ok := s.roomParam(w, r)
+	if !ok {
+		return
+	}
+	s.touch(r.Context(), room)
+	if snap := s.roomState(room).m.latest.Load(); snap != nil {
 		writeJSON(w, snap)
 		return
 	}
@@ -435,6 +597,10 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
+	room, ok := s.roomParam(w, r)
+	if !ok {
+		return
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -444,6 +610,7 @@ func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	rs := s.roomState(room)
 	t := time.NewTicker(sampleInterval)
 	defer t.Stop()
 	for {
@@ -451,7 +618,9 @@ func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-t.C:
-			snap := s.m.latest.Load()
+			// An open stream keeps the room alive even when load is stopped.
+			s.touch(r.Context(), room)
+			snap := rs.m.latest.Load()
 			if snap == nil {
 				continue
 			}
@@ -463,8 +632,13 @@ func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleChaosLatency(w http.ResponseWriter, r *http.Request) {
+	room, ok := s.roomParam(w, r)
+	if !ok {
+		return
+	}
+	s.touch(r.Context(), room)
 	until := time.Now().Add(chaosDuration).UnixMilli()
-	if err := s.rdb.Set(r.Context(), latencyUntilKey, until, 2*chaosDuration).Err(); err != nil {
+	if err := s.rdb.Set(r.Context(), roomKey(room, "chaos:latency_until_ms"), until, 2*chaosDuration).Err(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
