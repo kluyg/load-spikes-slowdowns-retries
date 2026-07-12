@@ -4,7 +4,29 @@
 
 const SPIKE_MS = 8000; // keep in sync with backend chaosDuration
 
+// --- Room ------------------------------------------------------------------
+// Every browser gets an isolated room: its own queue, config, metrics, and
+// backend capacity. The id lives in the URL hash so a room is bookmarkable and
+// shareable — open the same #room= link on two tabs to share one experiment,
+// or just load the page twice to get two independent systems.
+function roomId() {
+  const m = location.hash.match(/room=([A-Za-z0-9_-]{1,64})/);
+  if (m) return m[1];
+  const id = Array.from(crypto.getRandomValues(new Uint8Array(6)))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  location.hash = "room=" + id;
+  return id;
+}
+const ROOM = roomId();
+
+// withRoom appends the room id to an API path so every RPC lands in this room.
+function withRoom(path) {
+  return path + (path.includes("?") ? "&" : "?") + "room=" + encodeURIComponent(ROOM);
+}
+
 const worker = new Worker("/worker.js");
+worker.postMessage({ type: "config", room: ROOM }); // hand the room to the client tier
 
 // Client-observed goodput (requests that completed before their deadline).
 let completedThisSecond = 0;
@@ -29,7 +51,7 @@ worker.onmessage = (e) => {
 
 // --- Server metric stream (SSE) --------------------------------------------
 
-const es = new EventSource("/api/stream");
+const es = new EventSource(withRoom("/api/stream"));
 es.onmessage = (e) => {
   try {
     server = JSON.parse(e.data);
@@ -67,7 +89,7 @@ const cfgInputs = {
 
 async function loadConfig() {
   try {
-    const c = await (await fetch("/api/config")).json();
+    const c = await (await fetch(withRoom("/api/config"))).json();
     cfgInputs.shed_mode.value = c.shed_mode;
     cfgInputs.max_qps.value = c.max_qps;
     cfgInputs.inflight_quota.value = c.inflight_quota;
@@ -95,7 +117,7 @@ async function postConfig() {
     latency_ms: Number(cfgInputs.latency_ms.value),
   };
   try {
-    await fetch("/api/config", {
+    await fetch(withRoom("/api/config"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -112,6 +134,7 @@ Object.values(cfgInputs).forEach((input) => (input.onchange = postConfig));
 function pushClientConfig() {
   worker.postMessage({
     type: "config",
+    room: ROOM,
     qps: Number(qpsInput.value),
     clientDeadlineMs: Number(clientDeadlineInput.value),
     retryStrategy: retryStrategyInput.value,
@@ -145,7 +168,7 @@ spikeLoadBtn.onclick = () => {
 
 spikeLatencyBtn.onclick = async () => {
   try {
-    await fetch("/api/chaos/latency", { method: "POST" });
+    await fetch(withRoom("/api/chaos/latency"), { method: "POST" });
     flash(spikeLatencyBtn);
   } catch (err) {
     /* ignore */
@@ -159,7 +182,7 @@ function flash(btn) {
 
 clearQueueBtn.onclick = async () => {
   try {
-    await fetch("/api/admin/clear-queue", { method: "POST" });
+    await fetch(withRoom("/api/admin/clear-queue"), { method: "POST" });
     clearQueueBtn.classList.add("active");
     setTimeout(() => clearQueueBtn.classList.remove("active"), 600);
   } catch (err) {
@@ -330,7 +353,7 @@ async function applyPreset(p, btn) {
 
   // Reset server state so each scenario starts from a clean slate.
   try {
-    await fetch("/api/admin/clear-queue", { method: "POST" });
+    await fetch(withRoom("/api/admin/clear-queue"), { method: "POST" });
   } catch (err) {
     /* ignore */
   }
@@ -365,7 +388,7 @@ async function applyPreset(p, btn) {
   } else if (p.autoSpike === "latency") {
     presetSpikeTimer = setTimeout(async () => {
       try {
-        await fetch("/api/chaos/latency", { method: "POST" });
+        await fetch(withRoom("/api/chaos/latency"), { method: "POST" });
       } catch (err) {
         /* ignore */
       }
@@ -382,5 +405,10 @@ PRESETS.forEach((p) => {
   b.onclick = () => applyPreset(p, b);
   presetsRow.appendChild(b);
 });
+
+// Show the room id and a shareable link to this exact experiment.
+el("room-id").textContent = ROOM;
+const roomLink = el("room-link");
+roomLink.href = location.origin + location.pathname + "#room=" + ROOM;
 
 loadConfig();
