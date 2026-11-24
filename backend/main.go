@@ -83,8 +83,15 @@ type completion struct {
 // roomPool is one room's dedicated slice of capacity: CONCURRENCY workers plus a
 // refresher, all under ctx. cfgPtr/latencyUntilMs cache the room's live state so
 // the workers never hit Redis on the hot path.
+//
+// Each pool owns its own Redis client. An idle worker parks in a blocking pop,
+// holding a connection for the whole wait, so a client shared across rooms runs
+// out of connections once enough rooms are open (go-redis defaults to
+// 10 x GOMAXPROCS, i.e. 10 on a 1-vCPU host) — and then idle rooms starve busy
+// ones, which is exactly the cross-room interference rooms exist to prevent.
 type roomPool struct {
 	cancel         context.CancelFunc
+	rdb            *redis.Client
 	cfgPtr         atomic.Pointer[Config]
 	latencyUntilMs atomic.Int64
 }
@@ -97,12 +104,12 @@ func main() {
 	ctx := context.Background()
 
 	log.Printf("backend starting: concurrency=%d/room redis=%s", concurrency, addr)
-	manageRooms(ctx, rdb, concurrency)
+	manageRooms(ctx, rdb, addr, concurrency)
 }
 
 // manageRooms polls the `rooms` set and keeps one pool alive per active room:
 // start a pool the first time a room appears, cancel it once the room goes stale.
-func manageRooms(ctx context.Context, rdb *redis.Client, concurrency int) {
+func manageRooms(ctx context.Context, rdb *redis.Client, addr string, concurrency int) {
 	pools := map[string]*roomPool{}
 	t := time.NewTicker(managePeriod)
 	defer t.Stop()
@@ -122,13 +129,13 @@ func manageRooms(ctx context.Context, rdb *redis.Client, concurrency int) {
 		for _, room := range active {
 			activeSet[room] = true
 			if pools[room] == nil {
-				pools[room] = startPool(ctx, rdb, room, concurrency)
+				pools[room] = startPool(ctx, addr, room, concurrency)
 				log.Printf("room %s: pool up (%d workers)", room, concurrency)
 			}
 		}
 		for room, p := range pools {
 			if !activeSet[room] {
-				p.cancel()
+				p.stop()
 				delete(pools, room)
 				log.Printf("room %s: pool down (idle)", room)
 			}
@@ -137,9 +144,12 @@ func manageRooms(ctx context.Context, rdb *redis.Client, concurrency int) {
 	}
 }
 
-func startPool(parent context.Context, rdb *redis.Client, room string, concurrency int) *roomPool {
+func startPool(parent context.Context, addr, room string, concurrency int) *roomPool {
 	ctx, cancel := context.WithCancel(parent)
-	p := &roomPool{cancel: cancel}
+	// One connection per worker (each may be parked in a blocking pop) plus
+	// headroom for the refresher, so nothing in this room ever waits on the pool.
+	rdb := redis.NewClient(&redis.Options{Addr: addr, PoolSize: concurrency + 2})
+	p := &roomPool{cancel: cancel, rdb: rdb}
 	c := defaultConfig()
 	p.cfgPtr.Store(&c)
 
@@ -148,6 +158,14 @@ func startPool(parent context.Context, rdb *redis.Client, room string, concurren
 		go runWorker(ctx, rdb, room, p)
 	}
 	return p
+}
+
+// stop tears the pool down. Closing the client also breaks workers out of a
+// blocking pop immediately; otherwise one could sit there for seconds after the
+// cancel and swallow an item enqueued for the room's next pool.
+func (p *roomPool) stop() {
+	p.cancel()
+	p.rdb.Close()
 }
 
 // refreshRoomState keeps a pool's cached config + latency-spike deadline current
@@ -254,6 +272,9 @@ func runWorker(ctx context.Context, rdb *redis.Client, room string, p *roomPool)
 		}
 
 		time.Sleep(sampleLatency(cfg, p))
+		if ctx.Err() != nil {
+			return // pool cancelled mid-item; the room's keys are about to be deleted
+		}
 
 		if err := rdb.Set(ctx, roomKey(room, "op:"+item.ID), "done", time.Hour).Err(); err != nil {
 			log.Printf("set error: %v", err)
