@@ -30,6 +30,9 @@ worker.postMessage({ type: "config", room: ROOM }); // hand the room to the clie
 
 // Client-observed goodput (requests that completed before their deadline).
 let completedThisSecond = 0;
+// Client-observed latencies (ms) of the logical requests that completed this
+// second. Percentiles are taken over this one-second window, like goodput.
+let latenciesThisSecond = [];
 let running = false;
 
 let server = {
@@ -44,9 +47,16 @@ let server = {
 const goodputHistory = [];
 const tputHistory = [];
 const queueHistory = [];
+// null marks a second with no completions: there is no latency to report, and
+// drawing 0 there would make a collapse look fast.
+const p50History = [];
+const p99History = [];
 
 worker.onmessage = (e) => {
-  if (e.data.type === "completed") completedThisSecond++;
+  if (e.data.type === "completed") {
+    completedThisSecond++;
+    if (e.data.latencyMs != null) latenciesThisSecond.push(e.data.latencyMs);
+  }
 };
 
 // --- Server metric stream (SSE) --------------------------------------------
@@ -196,27 +206,48 @@ setInterval(() => {
   push(goodputHistory, completedThisSecond);
   push(tputHistory, Math.round(server.throughput_ps));
   push(queueHistory, server.queue_len);
-  render(completedThisSecond);
+  const sorted = latenciesThisSecond.sort((a, b) => a - b);
+  const p50 = percentile(sorted, 50);
+  const p99 = percentile(sorted, 99);
+  push(p50History, p50);
+  push(p99History, p99);
+  render(completedThisSecond, p50, p99);
   completedThisSecond = 0;
+  latenciesThisSecond = [];
 }, 1000);
+
+// percentile uses the nearest-rank method on an ascending array: the smallest
+// sample with at least p% of the samples at or below it. Returns null when
+// there are no samples. With fewer than 100 samples p99 is simply the max.
+function percentile(sorted, p) {
+  if (sorted.length === 0) return null;
+  const rank = Math.ceil((p / 100) * sorted.length);
+  return Math.round(sorted[Math.max(rank, 1) - 1]);
+}
 
 function push(arr, v) {
   arr.push(v);
   if (arr.length > 60) arr.shift();
 }
 
-function render(goodput) {
+function render(goodput, p50, p99) {
   setText("m-goodput", goodput);
   setText("m-tput", Math.round(server.throughput_ps));
   setText("m-qps", Math.round(server.start_work_qps + server.get_op_qps));
   setText("m-fail", Math.round(server.rpc_failure_ps));
   setText("m-inflight", server.in_flight);
   setText("m-queue", server.queue_len);
+  setText("m-p50", p50 == null ? "\u2013" : p50);
+  setText("m-p99", p99 == null ? "\u2013" : p99);
   drawChart(mainCanvas, [
     { data: tputHistory, color: "#58a6ff" },
     { data: goodputHistory, color: "#3fb950" },
   ], "ops/s");
   drawChart(queueCanvas, [{ data: queueHistory, color: "#d29922" }], "items");
+  drawChart(latencyCanvas, [
+    { data: p99History, color: "#f778ba" },
+    { data: p50History, color: "#a371f7" },
+  ], "ms");
 }
 
 function setText(id, value) {
@@ -227,6 +258,7 @@ function setText(id, value) {
 
 const mainCanvas = el("main-chart");
 const queueCanvas = el("queue-chart");
+const latencyCanvas = el("latency-chart");
 
 // niceCeil rounds up to a 1/2/5 x 10^n value so axis ticks land on round numbers.
 function niceCeil(v) {
@@ -248,7 +280,9 @@ function drawChart(canvas, series, unit) {
   ctx.clearRect(0, 0, w, h);
 
   let rawMax = 10;
-  series.forEach((s) => s.data.forEach((v) => (rawMax = Math.max(rawMax, v))));
+  series.forEach((s) => s.data.forEach((v) => {
+    if (v != null) rawMax = Math.max(rawMax, v);
+  }));
   const max = niceCeil(rawMax);
 
   ctx.font = "10px -apple-system, 'Segoe UI', sans-serif";
@@ -292,23 +326,48 @@ function drawChart(canvas, series, unit) {
   });
 
   series.forEach((s) => {
-    if (s.data.length < 2) return;
     // Newest sample pinned at the right edge; the series grows in from the right.
     const offset = 60 - s.data.length;
-    ctx.beginPath();
+    const xAt = (i) => padL + (offset + i) * stepX;
+    const yAt = (v) => padT + plotH - v * scaleY;
+
+    // A null sample means "no data that second": split the series into runs of
+    // real samples and leave a gap between them rather than drawing through.
+    const runs = [];
+    let run = null;
     s.data.forEach((v, i) => {
-      const x = padL + (offset + i) * stepX;
-      const y = padT + plotH - v * scaleY;
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      if (v == null) {
+        run = null;
+        return;
+      }
+      if (!run) runs.push((run = []));
+      run.push(i);
     });
-    ctx.strokeStyle = s.color;
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.lineTo(padL + 59 * stepX, padT + plotH);
-    ctx.lineTo(padL + offset * stepX, padT + plotH);
-    ctx.closePath();
-    ctx.fillStyle = s.color + "1f"; // ~12% alpha
-    ctx.fill();
+
+    runs.forEach((idx) => {
+      if (idx.length === 1) {
+        // An isolated sample has no neighbour to connect to; show it as a dot.
+        ctx.beginPath();
+        ctx.arc(xAt(idx[0]), yAt(s.data[idx[0]]), 2, 0, 2 * Math.PI);
+        ctx.fillStyle = s.color;
+        ctx.fill();
+        return;
+      }
+      ctx.beginPath();
+      idx.forEach((i, n) => {
+        const x = xAt(i);
+        const y = yAt(s.data[i]);
+        n === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = s.color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.lineTo(xAt(idx[idx.length - 1]), padT + plotH);
+      ctx.lineTo(xAt(idx[0]), padT + plotH);
+      ctx.closePath();
+      ctx.fillStyle = s.color + "1f"; // ~12% alpha
+      ctx.fill();
+    });
   });
 }
 

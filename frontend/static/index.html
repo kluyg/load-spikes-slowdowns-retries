@@ -16,6 +16,8 @@
       --tput: #58a6ff;
       --warn: #d29922;
       --bad: #f85149;
+      --p50: #a371f7;
+      --p99: #f778ba;
     }
     * { box-sizing: border-box; }
     body {
@@ -80,6 +82,11 @@
     .card.goodput .value { color: var(--good); }
     .card.tput .value { color: var(--tput); }
     .card.fail .value { color: var(--bad); }
+    .card.p50 .value { color: var(--p50); }
+    .card.p99 .value { color: var(--p99); }
+    .card .value small { font-size: 13px; font-weight: 400; color: var(--muted); }
+    .chart.wide { grid-column: 1 / -1; }
+    .chart .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
     .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     @media (max-width: 720px) { .charts { grid-template-columns: 1fr; } }
     .chart { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
@@ -193,6 +200,14 @@
         <div class="label">Queue length</div>
         <div class="value" id="m-queue">0</div>
       </div>
+      <div class="card p50">
+        <div class="label">Latency p50</div>
+        <div class="value"><span id="m-p50">&ndash;</span> <small>ms</small></div>
+      </div>
+      <div class="card p99">
+        <div class="label">Latency p99</div>
+        <div class="value"><span id="m-p99">&ndash;</span> <small>ms</small></div>
+      </div>
     </div>
 
     <div class="charts">
@@ -206,6 +221,14 @@
       <div class="chart">
         <div class="label"><span class="legend"><span class="swatch" style="background:var(--warn)"></span>Queue length</span></div>
         <canvas id="queue-chart"></canvas>
+      </div>
+      <div class="chart wide">
+        <div class="label">
+          <span class="legend"><span class="swatch" style="background:var(--p99)"></span>Client latency p99</span>
+          <span class="legend"><span class="swatch" style="background:var(--p50)"></span>Client latency p50</span>
+        </div>
+        <canvas id="latency-chart"></canvas>
+        <div class="note">Successful requests only, start to answer, including retries and backoff. A gap means nothing succeeded that second.</div>
       </div>
     </div>
   </main>
