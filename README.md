@@ -151,6 +151,27 @@ Shedding caps the queue at the quota so the backend always has fresh work it can
 finish in time. Because the client honors the 429 (stops instead of retrying),
 shedding also prevents the retry storm from forming in the first place.
 
+## Reproducing the numbers
+
+The tables above come from [`loadgen/`](loadgen/), a headless twin of the
+browser client: the same `StartWork` + poll loop and retry policy as
+`static/worker.js`, driven from Go through scripted scenarios (5 s warmup at
+60/s, a 10 s spike, 15 s cooldown). With the stack up:
+
+```sh
+cd loadgen
+go run . -list                       # the scenarios
+go run . -format markdown            # run them all, print README-shaped tables
+go run . -scenario fifo,lifo,margin  # or just some; -format json adds a per-second timeline
+go run . -check                      # exit 1 if a claim above stops holding
+```
+
+Each scenario runs in its own fresh room, so runs don't contaminate each other
+or anyone using the UI. `-check` asserts the *shapes* (LIFO and deadline + margin
+beat FIFO, retries amplify and never recover, clearing the queue doesn't help,
+shedding pins the queue and recovers), not the absolute numbers, and CI runs it
+against the real `docker compose` stack on every push.
+
 ## Implementation notes
 
 - **Pub/sub is a fast path, never a source of truth.** `GetOperation` falls back

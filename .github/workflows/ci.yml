@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: ${{ matrix.module }} (fmt, vet, test, build)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [frontend, backend, loadgen]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache: false
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -d .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go build ./...
+
+  scenarios:
+    name: README scenarios against the real stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: loadgen/go.mod
+          cache: false
+      - name: Start the stack
+        run: docker compose up --build --detach
+      - name: Run every scenario and check the README's claims
+        working-directory: loadgen
+        run: |
+          go build -o loadgen .
+          ./loadgen -wait 60s -check -format markdown | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Stack logs
+        if: failure()
+        run: docker compose logs --tail 200
