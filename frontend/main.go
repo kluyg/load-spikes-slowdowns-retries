@@ -88,7 +88,11 @@ type workItem struct {
 type completion struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
+	TTLMs  int64  `json:"ttl_ms"` // how long a "done" is worth remembering
 }
+
+// doneDefaultTTL applies when a completion carries no ttl_ms.
+const doneDefaultTTL = 60 * time.Second
 
 // Config holds the live-tunable knobs. The frontend acts on QueueMax; the rest
 // are owned by the backend but stored/served here so the UI has one place to
@@ -173,7 +177,7 @@ type roomState struct {
 	cfgPtr       atomic.Pointer[Config]
 	clearEpochMs atomic.Int64 // ops enqueued before this were cleared -> 404
 	bucket       tokenBucket  // rate limiter for this room's qps shed policy
-	done         sync.Map     // completion fast-path (op id -> struct{})
+	done         sync.Map     // completion fast-path (op id -> expiry unix ms)
 
 	// bornMs is when this in-process state was created. The janitor drops a
 	// room's state and keys once it goes idle, so a tab that comes back later
@@ -360,7 +364,11 @@ func (s *server) subscribeCompletions(ctx context.Context) {
 		rs := s.rooms[room]
 		s.mu.Unlock()
 		if rs != nil {
-			rs.done.Store(c.ID, struct{}{})
+			ttl := c.TTLMs
+			if ttl <= 0 {
+				ttl = doneDefaultTTL.Milliseconds()
+			}
+			rs.done.Store(c.ID, time.Now().UnixMilli()+ttl)
 		}
 	}
 }
@@ -413,6 +421,19 @@ func (s *server) gcRooms(ctx context.Context) {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 	for range t.C {
+		// Forget finished ops nobody can still be polling for, on the same
+		// schedule as their Redis markers; otherwise a busy room's map grows
+		// by its whole throughput for as long as the room lives.
+		now := time.Now().UnixMilli()
+		for _, rs := range s.activeRooms() {
+			rs.done.Range(func(id, exp any) bool {
+				if exp.(int64) <= now {
+					rs.done.Delete(id)
+				}
+				return true
+			})
+		}
+
 		cutoff := time.Now().Add(-roomIdleGC).UnixMilli()
 		stale, err := s.rdb.ZRangeByScore(ctx, roomsKey, &redis.ZRangeBy{
 			Min: "-inf",

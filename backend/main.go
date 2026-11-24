@@ -50,6 +50,13 @@ const (
 	// are gone before its keys are deleted.
 	roomIdleStop = 15 * time.Second
 	managePeriod = 500 * time.Millisecond
+	// A finished op's "done" record only matters while its client is still
+	// polling, i.e. until the op's deadline. Keep it that long plus doneBuffer
+	// (generous slack for clock skew between browser and server, and for a late
+	// final poll), never longer than doneMaxTTL however far out the client-
+	// supplied deadline claims to be.
+	doneBuffer = 60 * time.Second
+	doneMaxTTL = time.Hour
 )
 
 // roomKey builds the Redis key for a per-room datum. Everything a room touches
@@ -78,6 +85,24 @@ type workItem struct {
 type completion struct {
 	ID     string `json:"id"`
 	Status string `json:"status"` // "done" | "dropped"
+	// TTLMs is how long a "done" is worth remembering (see doneTTL). The
+	// frontend expires its in-memory record on the same schedule as the Redis
+	// marker.
+	TTLMs int64 `json:"ttl_ms,omitempty"`
+}
+
+// doneTTL is how long to remember that an op finished: until its deadline plus
+// doneBuffer. An op with no deadline, or one already past it, gets the buffer
+// alone.
+func doneTTL(deadlineMs, nowMs int64) time.Duration {
+	ttl := doneBuffer
+	if left := time.Duration(deadlineMs-nowMs) * time.Millisecond; deadlineMs > 0 && left > 0 {
+		ttl += left
+	}
+	if ttl > doneMaxTTL {
+		ttl = doneMaxTTL
+	}
+	return ttl
 }
 
 // roomPool is one room's dedicated slice of capacity: CONCURRENCY workers plus a
@@ -267,7 +292,7 @@ func runWorker(ctx context.Context, rdb *redis.Client, room string, p *roomPool)
 		}
 		if drop {
 			rdb.Decr(ctx, inflightKey)
-			publish(ctx, rdb, room, item.ID, "dropped")
+			publish(ctx, rdb, room, item.ID, "dropped", 0)
 			continue
 		}
 
@@ -276,12 +301,13 @@ func runWorker(ctx context.Context, rdb *redis.Client, room string, p *roomPool)
 			return // pool cancelled mid-item; the room's keys are about to be deleted
 		}
 
-		if err := rdb.Set(ctx, roomKey(room, "op:"+item.ID), "done", time.Hour).Err(); err != nil {
+		ttl := doneTTL(item.DeadlineMs, time.Now().UnixMilli())
+		if err := rdb.Set(ctx, roomKey(room, "op:"+item.ID), "done", ttl).Err(); err != nil {
 			log.Printf("set error: %v", err)
 		}
 		rdb.Incr(ctx, throughputKey)
 		rdb.Decr(ctx, inflightKey)
-		publish(ctx, rdb, room, item.ID, "done")
+		publish(ctx, rdb, room, item.ID, "done", ttl)
 	}
 }
 
@@ -302,8 +328,8 @@ func sampleLatency(cfg Config, p *roomPool) time.Duration {
 	return d
 }
 
-func publish(ctx context.Context, rdb *redis.Client, room, id, status string) {
-	b, _ := json.Marshal(completion{ID: id, Status: status})
+func publish(ctx context.Context, rdb *redis.Client, room, id, status string, ttl time.Duration) {
+	b, _ := json.Marshal(completion{ID: id, Status: status, TTLMs: ttl.Milliseconds()})
 	rdb.Publish(ctx, roomKey(room, "completions"), b)
 }
 
