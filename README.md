@@ -47,6 +47,11 @@ spins a pool up when a room appears, tearing it down a few seconds after the tab
 goes away; a frontend janitor then deletes the room's keys. Open the page twice
 for two independent systems, or share a `#room=` link to watch one together.
 
+The frontend allows at most `MAX_ROOMS` rooms at once (default 20, a rough
+figure for one shared vCPU). A new room past the cap gets a 503 on every
+endpoint and its page waits, retrying, until a room frees up; rooms that
+already exist are never turned away.
+
 The request flow is the Long-Running-Operation poll pattern: `StartWork` returns
 an operation id; the client polls `GetOperation` until it's done or the client's
 deadline passes. Capacity ≈ workers ÷ latency = 4 ÷ 50 ms ≈ **80 ops/s**.

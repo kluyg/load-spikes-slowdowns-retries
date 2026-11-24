@@ -60,6 +60,13 @@ const (
 	// is longer than the backend's roomIdleStop so a room's workers are gone
 	// before we delete the keys they might otherwise write to.
 	roomIdleGC = 20 * time.Second
+	// defaultMaxRooms caps how many rooms may be live at once (override with
+	// MAX_ROOMS; 0 or less means no cap). Each room is a worker pool, a handful
+	// of Redis connections and, above all, its tab's request load, so an
+	// unbounded number of them lets anyone with the link bury the box. 20 is a
+	// back-of-envelope figure for one shared vCPU: a room at the default 60 QPS
+	// costs roughly 120 requests/s, against a budget of very roughly 3,000.
+	defaultMaxRooms = 20
 )
 
 // roomRe bounds room ids so they're safe to splice into Redis keys.
@@ -194,6 +201,9 @@ type server struct {
 	rdb   *redis.Client
 	mu    sync.Mutex
 	rooms map[string]*roomState
+
+	maxRooms int        // live-room cap; <= 0 disables it
+	admitMu  sync.Mutex // serializes new-room admission so the cap can't be raced past
 }
 
 // roomState returns the room's state, creating it (with default config) on first
@@ -219,14 +229,53 @@ func (rs *roomState) config() Config {
 }
 
 // roomParam validates and returns the request's room id, writing a 400 if it's
-// missing or malformed.
+// missing or malformed, or a 503 if the room is new and the server is full.
 func (s *server) roomParam(w http.ResponseWriter, r *http.Request) (string, bool) {
 	room := r.URL.Query().Get("room")
 	if !roomRe.MatchString(room) {
 		http.Error(w, "missing or invalid room", http.StatusBadRequest)
 		return "", false
 	}
+	if !s.admit(r.Context(), room) {
+		// X-Rooms-Full tells the page this 503 apart from "queue full", so it
+		// can say what's going on and keep trying until a room frees up.
+		w.Header().Set("X-Rooms-Full", "1")
+		w.Header().Set("Retry-After", strconv.Itoa(int(roomIdleGC.Seconds())))
+		http.Error(w, "all rooms are in use, try again in a minute", http.StatusServiceUnavailable)
+		return "", false
+	}
 	return room, true
+}
+
+// admit reports whether a request may use the room. A room we already track is
+// always let through; only creating a new one is subject to the cap. The count
+// is taken from the `rooms` set rather than our own map because the set is what
+// the backend spins worker pools up from, and it survives a frontend restart.
+func (s *server) admit(ctx context.Context, room string) bool {
+	s.mu.Lock()
+	_, known := s.rooms[room]
+	s.mu.Unlock()
+	if known || s.maxRooms <= 0 {
+		return true
+	}
+
+	s.admitMu.Lock()
+	defer s.admitMu.Unlock()
+	// A room already in the set is live even if we don't know it yet (we just
+	// restarted under it): let it back in rather than strand its open tab.
+	if _, err := s.rdb.ZScore(ctx, roomsKey, room).Result(); err == nil {
+		s.roomState(room)
+		return true
+	} else if err != redis.Nil {
+		return false
+	}
+	if n, err := s.rdb.ZCard(ctx, roomsKey).Result(); err != nil || n >= int64(s.maxRooms) {
+		return false
+	}
+	// Claim the slot before releasing admitMu so the next newcomer counts it.
+	s.touch(ctx, room)
+	s.roomState(room)
+	return true
 }
 
 // touch marks a room active so the backend keeps its pool up and the janitor
@@ -252,7 +301,7 @@ func (s *server) shouldShed(ctx context.Context, room string, rs *roomState, cfg
 func main() {
 	addr := getenv("REDIS_ADDR", "localhost:6379")
 	rdb := redis.NewClient(&redis.Options{Addr: addr})
-	s := &server{rdb: rdb, rooms: map[string]*roomState{}}
+	s := &server{rdb: rdb, rooms: map[string]*roomState{}, maxRooms: getenvInt("MAX_ROOMS", defaultMaxRooms)}
 
 	go s.subscribeCompletions(context.Background())
 	go s.runSampler(context.Background())
@@ -275,7 +324,7 @@ func main() {
 	mux.HandleFunc("/api/admin/clear-queue", s.handleClearQueue)
 
 	listen := ":" + getenv("PORT", "8080")
-	log.Printf("frontend listening on %s (redis=%s)", listen, addr)
+	log.Printf("frontend listening on %s (redis=%s, max rooms=%d)", listen, addr, s.maxRooms)
 	log.Fatal(http.ListenAndServe(listen, mux))
 }
 
@@ -703,6 +752,15 @@ func writeJSON(w http.ResponseWriter, v any) {
 func getenv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func getenvInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return def
 }

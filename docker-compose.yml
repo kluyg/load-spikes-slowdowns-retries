@@ -21,6 +21,9 @@ services:
     environment:
       REDIS_ADDR: redis:6379
       PORT: "8080"
+      # Most rooms (isolated per-visitor systems) allowed live at once; a rough
+      # figure for one shared vCPU. 0 removes the cap.
+      MAX_ROOMS: "20"
     ports:
       - "8080:8080"
     depends_on:

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -63,5 +64,36 @@ func TestRoomParamRejectsBadIDs(t *testing.T) {
 		if !ok && w.Code != 400 {
 			t.Errorf("roomParam(%q) wrote status %d, want 400", query, w.Code)
 		}
+	}
+}
+
+// Without Redis these cover only the paths that never reach it: a room we
+// already track, and the cap switched off. The cap itself is exercised against
+// the real stack.
+func TestAdmitKnownRoomIgnoresCap(t *testing.T) {
+	s := &server{rooms: map[string]*roomState{}, maxRooms: 1}
+	s.roomState("mine")
+	if !s.admit(context.Background(), "mine") {
+		t.Error("a room that already exists was refused")
+	}
+}
+
+func TestAdmitUncapped(t *testing.T) {
+	s := &server{rooms: map[string]*roomState{}, maxRooms: 0}
+	for _, room := range []string{"a", "b", "c"} {
+		if !s.admit(context.Background(), room) {
+			t.Errorf("room %q refused with the cap disabled", room)
+		}
+	}
+}
+
+func TestGetenvInt(t *testing.T) {
+	t.Setenv("MAX_ROOMS_TEST", "7")
+	if got := getenvInt("MAX_ROOMS_TEST", 20); got != 7 {
+		t.Errorf("getenvInt = %d, want 7", got)
+	}
+	t.Setenv("MAX_ROOMS_TEST", "lots")
+	if got := getenvInt("MAX_ROOMS_TEST", 20); got != 20 {
+		t.Errorf("getenvInt with junk = %d, want the default 20", got)
 	}
 }

@@ -31,6 +31,7 @@
     header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
     header p.room code { color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
     header p.room a { color: var(--accent); }
+    header p.rooms-full { color: var(--text); background: var(--panel); border: 1px solid var(--accent); border-radius: 6px; padding: 8px 12px; margin-top: 12px; }
     main { padding: 24px; max-width: 1040px; margin: 0 auto; }
     .panel {
       background: var(--panel);
@@ -101,6 +102,7 @@
     <h1>Load Spikes, Slowdowns &amp; Retries</h1>
     <p>Backend knobs &mdash; reproduce the throughput-vs-goodput dynamics from "Shed your load." Capacity &approx; 80 ops/s (4 workers &times; 50&nbsp;ms).</p>
     <p class="room">Room <code id="room-id"></code> &mdash; <a id="room-link" href="#">shareable link</a>. Each room is an isolated system with its own capacity; open the page in a new tab for a fresh one.</p>
+    <p id="rooms-full" class="rooms-full" hidden>All rooms are in use right now, so this one can't start yet. It will connect by itself as soon as one frees up &mdash; usually within a minute.</p>
   </header>
   <main>
     <div class="panel">
