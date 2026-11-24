@@ -70,6 +70,29 @@ es.onmessage = (e) => {
   }
 };
 
+// The stream opens with a "hello" naming the room's incarnation. EventSource
+// reconnects by itself after a network drop or laptop sleep, and the server
+// deletes a room that has been idle for ~20 s — so a reconnect may land in a
+// fresh room running default config while the knobs here still show the old
+// values. A changed incarnation means exactly that: push the knobs back so the
+// server matches what's on screen. Same incarnation means the room survived
+// (and someone sharing it may have changed it), so pull the server's config.
+let roomBornMs = null;
+es.addEventListener("hello", (e) => {
+  let born;
+  try {
+    born = JSON.parse(e.data).born_ms;
+  } catch (err) {
+    return;
+  }
+  const first = roomBornMs === null;
+  const changed = !first && born !== roomBornMs;
+  roomBornMs = born;
+  if (first) return; // initial page load: loadConfig() below handles it
+  if (changed) postConfig();
+  else loadConfig();
+});
+
 // --- Elements ---------------------------------------------------------------
 
 const el = (id) => document.getElementById(id);

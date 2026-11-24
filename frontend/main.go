@@ -175,6 +175,12 @@ type roomState struct {
 	bucket       tokenBucket  // rate limiter for this room's qps shed policy
 	done         sync.Map     // completion fast-path (op id -> struct{})
 
+	// bornMs is when this in-process state was created. The janitor drops a
+	// room's state and keys once it goes idle, so a tab that comes back later
+	// lands in a brand-new room with default config. The metric stream reports
+	// bornMs on connect so the tab can tell that happened and re-apply its knobs.
+	bornMs int64
+
 	// sampler's previous cumulative values, for per-interval rates. Only the
 	// sampler goroutine touches these, so they need no synchronization.
 	lsw, lgo, lok, lerr, ldone int64
@@ -193,7 +199,7 @@ func (s *server) roomState(room string) *roomState {
 	defer s.mu.Unlock()
 	rs := s.rooms[room]
 	if rs == nil {
-		rs = &roomState{}
+		rs = &roomState{bornMs: time.Now().UnixMilli()}
 		c := defaultConfig()
 		rs.cfgPtr.Store(&c)
 		s.rooms[room] = rs
@@ -610,7 +616,16 @@ func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	s.touch(r.Context(), room)
 	rs := s.roomState(room)
+
+	// Greet the tab with the room's incarnation. EventSource reconnects on its
+	// own after a network drop or laptop sleep; if the room was garbage
+	// collected in the meantime, born_ms differs from what the tab saw before
+	// and it knows the server is back on default config.
+	fmt.Fprintf(w, "event: hello\ndata: {\"born_ms\":%d}\n\n", rs.bornMs)
+	flusher.Flush()
+
 	t := time.NewTicker(sampleInterval)
 	defer t.Stop()
 	for {
