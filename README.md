@@ -191,6 +191,7 @@ against the real `docker compose` stack on every push.
   nothing structurally — every room's state is `room:<id>:…` keys and the
   backend scales workers with the number of live rooms. Idle rooms are garbage
   collected; the only thing left to expire on its own is the per-op `done`
-  marker (a 1 h TTL key), which is cheap.
+  marker, which lives until the op's deadline plus 60 s — once the client has
+  stopped polling, nobody can ask for it.
 - **Determinism caveat:** this is a real system, not a simulation, so absolute
   numbers vary run to run; the *shapes* and orderings are the point.
