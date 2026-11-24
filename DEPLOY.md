@@ -80,8 +80,14 @@ The public link is safe to share: each visitor gets an isolated room (its own
 queue, config, graphs, and a dedicated backend worker pool), so people driving
 it at the same time don't interfere. Cost scales with the number of *live*
 rooms — each is a handful of goroutines and a few small Redis keys, and idle
-rooms are torn down automatically — so the $6 Droplet comfortably handles a
-classroom's worth of simultaneous tabs.
+rooms are torn down automatically.
+
+The frontend caps the number of live rooms at 20 (`MAX_ROOMS`). A visitor past
+the cap sees "all rooms are in use" and is connected automatically once a room
+frees up, about 20 seconds after its tab closes. The default is a rough
+estimate for the $6 Droplet's single vCPU, where the limit is the request load
+of the tabs themselves rather than memory; raise `MAX_ROOMS` in
+`docker-compose.yml` on a bigger machine, or set it to 0 to remove the cap.
 
 ## Teardown
 

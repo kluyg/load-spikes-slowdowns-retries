@@ -61,15 +61,6 @@ worker.onmessage = (e) => {
 
 // --- Server metric stream (SSE) --------------------------------------------
 
-const es = new EventSource(withRoom("/api/stream"));
-es.onmessage = (e) => {
-  try {
-    server = JSON.parse(e.data);
-  } catch (err) {
-    /* ignore malformed frame */
-  }
-};
-
 // The stream opens with a "hello" naming the room's incarnation. EventSource
 // reconnects by itself after a network drop or laptop sleep, and the server
 // deletes a room that has been idle for ~20 s — so a reconnect may land in a
@@ -78,20 +69,68 @@ es.onmessage = (e) => {
 // server matches what's on screen. Same incarnation means the room survived
 // (and someone sharing it may have changed it), so pull the server's config.
 let roomBornMs = null;
-es.addEventListener("hello", (e) => {
-  let born;
-  try {
-    born = JSON.parse(e.data).born_ms;
-  } catch (err) {
-    return;
+
+function connectStream() {
+  const es = new EventSource(withRoom("/api/stream"));
+  es.onmessage = (e) => {
+    try {
+      server = JSON.parse(e.data);
+    } catch (err) {
+      /* ignore malformed frame */
+    }
+  };
+  es.addEventListener("hello", (e) => {
+    let born;
+    try {
+      born = JSON.parse(e.data).born_ms;
+    } catch (err) {
+      return;
+    }
+    const first = roomBornMs === null;
+    const changed = !first && born !== roomBornMs;
+    roomBornMs = born;
+    if (first) return; // config was just loaded or pushed by whoever connected us
+    if (changed) postConfig();
+    else loadConfig();
+  });
+  es.onerror = () => {
+    // The browser retries a dropped connection by itself, but gives up for good
+    // on an HTTP error — which is how the server answers a new room when it is
+    // already running as many as it allows. Take over and wait for a free one.
+    if (es.readyState === EventSource.CLOSED) waitForRoom();
+  };
+}
+
+// --- Waiting for a free room -----------------------------------------------
+// The server caps the number of live rooms. A new room past the cap gets a 503
+// marked X-Rooms-Full on every endpoint; rooms free up ~20 s after their tab
+// closes. Say so, probe until we're let in, then bring this room up with the
+// knobs on screen.
+const ROOM_RETRY_MS = 5000;
+let waitingForRoom = false;
+
+async function waitForRoom() {
+  if (waitingForRoom) return;
+  waitingForRoom = true;
+  const notice = document.getElementById("rooms-full");
+  for (;;) {
+    try {
+      const res = await fetch(withRoom("/api/config"));
+      if (res.ok) break;
+      notice.hidden = res.headers.get("X-Rooms-Full") !== "1";
+    } catch (err) {
+      /* server unreachable: keep trying quietly */
+    }
+    await new Promise((r) => setTimeout(r, ROOM_RETRY_MS));
   }
-  const first = roomBornMs === null;
-  const changed = !first && born !== roomBornMs;
-  roomBornMs = born;
-  if (first) return; // initial page load: loadConfig() below handles it
-  if (changed) postConfig();
-  else loadConfig();
-});
+  notice.hidden = true;
+  waitingForRoom = false;
+  roomBornMs = null; // whatever we connect to now is a room we just created
+  await postConfig();
+  connectStream();
+}
+
+connectStream();
 
 // --- Elements ---------------------------------------------------------------
 
