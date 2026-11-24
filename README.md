@@ -46,6 +46,11 @@ set (on every RPC and each metric-stream tick). The backend polls that set and
 spins a pool up when a room appears, tearing it down a few seconds after the tab
 goes away; a frontend janitor then deletes the room's keys. Open the page twice
 for two independent systems, or share a `#room=` link to watch one together.
+Tabs sharing a room share its backend knobs: a change in one tab is pushed to
+the others over the metric stream, and each change writes only the knob that
+was touched. The client knobs (QPS, deadline, retries) stay per tab, because
+every tab is its own client — each one that starts load adds to the room's
+total.
 
 The frontend allows at most `MAX_ROOMS` rooms at once (default 20, a rough
 figure for one shared vCPU). A new room past the cap gets a 503 on every

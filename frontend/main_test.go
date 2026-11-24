@@ -97,3 +97,26 @@ func TestGetenvInt(t *testing.T) {
 		t.Errorf("getenvInt with junk = %d, want the default 20", got)
 	}
 }
+
+func TestConfigUpdateWritesOnlyNamedKnobs(t *testing.T) {
+	set, err := configUpdate([]byte(`{"queue_mode":"LIFO","max_qps":0,"not_a_knob":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// max_qps is named with its zero value and must still be written; the seven
+	// knobs the body leaves out, and the unknown key, must not be.
+	if len(set) != 2 || set["queue_mode"] != "LIFO" || set["max_qps"] != int64(0) {
+		t.Errorf("configUpdate = %v, want only queue_mode=LIFO and max_qps=0", set)
+	}
+
+	full, err := configUpdate([]byte(`{"queue_mode":"FIFO","queue_max":0,"deadline_mode":"none","margin_ms":70,"latency_mode":"uniform","latency_ms":50,"shed_mode":"none","max_qps":0,"inflight_quota":0}`))
+	if err != nil || len(full) != 9 {
+		t.Errorf("a full config gave %d fields (err %v), want 9", len(full), err)
+	}
+
+	for _, bad := range []string{`{"max_qps":"lots"}`, `[1,2]`, `nope`} {
+		if _, err := configUpdate([]byte(bad)); err == nil {
+			t.Errorf("configUpdate(%s) accepted a malformed body", bad)
+		}
+	}
+}
