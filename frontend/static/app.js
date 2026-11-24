@@ -9,9 +9,13 @@ const SPIKE_MS = 8000; // keep in sync with backend chaosDuration
 // backend capacity. The id lives in the URL hash so a room is bookmarkable and
 // shareable — open the same #room= link on two tabs to share one experiment,
 // or just load the page twice to get two independent systems.
-function roomId() {
+function roomFromHash() {
   const m = location.hash.match(/room=([A-Za-z0-9_-]{1,64})/);
-  if (m) return m[1];
+  return m ? m[1] : null;
+}
+function roomId() {
+  const fromHash = roomFromHash();
+  if (fromHash) return fromHash;
   const id = Array.from(crypto.getRandomValues(new Uint8Array(6)))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
@@ -19,6 +23,15 @@ function roomId() {
   return id;
 }
 const ROOM = roomId();
+
+// Everything this page holds — the worker, the metric stream, the charts, the
+// knobs — belongs to ROOM. Changing only the hash (pasting another #room= link
+// into this tab, the back button, clearing it) doesn't reload the page by
+// itself, so it would keep driving the old room under a URL naming a new one.
+// Start over in whatever room the hash names now; no hash means a fresh room.
+window.addEventListener("hashchange", () => {
+  if (roomFromHash() !== ROOM) location.reload();
+});
 
 // withRoom appends the room id to an API path so every RPC lands in this room.
 function withRoom(path) {
