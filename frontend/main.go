@@ -61,6 +61,11 @@ const (
 	// is longer than the backend's roomIdleStop so a room's workers are gone
 	// before we delete the keys they might otherwise write to.
 	roomIdleGC = 20 * time.Second
+	// touchEvery is how often, at most, a room's activity is written to the
+	// `rooms` set. Every RPC and stream tick reports activity, but the idle
+	// windows that read it are 15 s and 20 s, so one write a second is plenty —
+	// and it keeps a Redis round trip off the request path the demo measures.
+	touchEvery = time.Second
 	// defaultMaxRooms caps how many rooms may be live at once (override with
 	// MAX_ROOMS; 0 or less means no cap). Each room is a worker pool, a handful
 	// of Redis connections and, above all, its tab's request load, so an
@@ -196,6 +201,9 @@ type roomState struct {
 	// viewers counts the open metric streams, i.e. tabs looking at this room.
 	viewers atomic.Int32
 
+	// lastTouchMs is when this room's activity was last written to Redis.
+	lastTouchMs atomic.Int64
+
 	// sampler's previous cumulative values, for per-interval rates. Only the
 	// sampler goroutine touches these, so they need no synchronization.
 	lsw, lgo, lok, lerr, ldone int64
@@ -283,9 +291,22 @@ func (s *server) admit(ctx context.Context, room string) bool {
 }
 
 // touch marks a room active so the backend keeps its pool up and the janitor
-// leaves its keys alone.
+// leaves its keys alone. It is called on every RPC and stream tick but writes
+// to Redis at most once per touchEvery per room.
 func (s *server) touch(ctx context.Context, room string) {
-	s.rdb.ZAdd(ctx, roomsKey, redis.Z{Score: float64(time.Now().UnixMilli()), Member: room})
+	now := time.Now().UnixMilli()
+	if !s.roomState(room).touchDue(now) {
+		return
+	}
+	s.rdb.ZAdd(ctx, roomsKey, redis.Z{Score: float64(now), Member: room})
+}
+
+// touchDue reports whether the room's activity should be written now, and if so
+// claims the write: of any callers racing within one touchEvery window, exactly
+// one gets true.
+func (rs *roomState) touchDue(nowMs int64) bool {
+	last := rs.lastTouchMs.Load()
+	return nowMs-last >= touchEvery.Milliseconds() && rs.lastTouchMs.CompareAndSwap(last, nowMs)
 }
 
 // shouldShed decides whether to reject an RPC under the room's shed policy.

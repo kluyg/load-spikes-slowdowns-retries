@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -118,5 +120,38 @@ func TestConfigUpdateWritesOnlyNamedKnobs(t *testing.T) {
 		if _, err := configUpdate([]byte(bad)); err == nil {
 			t.Errorf("configUpdate(%s) accepted a malformed body", bad)
 		}
+	}
+}
+
+func TestTouchDueOncePerWindow(t *testing.T) {
+	rs := &roomState{}
+	const t0 = int64(1_795_000_000_000)
+	if !rs.touchDue(t0) {
+		t.Fatal("the first touch of a room was not written")
+	}
+	for _, later := range []int64{0, 1, 500, 999} {
+		if rs.touchDue(t0 + later) {
+			t.Errorf("a touch %d ms after the last write was written again", later)
+		}
+	}
+	if !rs.touchDue(t0 + 1000) {
+		t.Error("a touch a full window after the last write was skipped")
+	}
+
+	// Many requests landing in the same instant must produce a single write.
+	var wg sync.WaitGroup
+	var wrote atomic.Int32
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if rs.touchDue(t0 + 5000) {
+				wrote.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if wrote.Load() != 1 {
+		t.Errorf("%d of 64 concurrent touches were written, want 1", wrote.Load())
 	}
 }
