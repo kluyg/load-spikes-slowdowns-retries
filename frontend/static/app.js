@@ -66,8 +66,12 @@ worker.onmessage = (e) => {
 // deletes a room that has been idle for ~20 s — so a reconnect may land in a
 // fresh room running default config while the knobs here still show the old
 // values. A changed incarnation means exactly that: push the knobs back so the
-// server matches what's on screen. Same incarnation means the room survived
-// (and someone sharing it may have changed it), so pull the server's config.
+// server matches what's on screen. Same incarnation means the room survived;
+// the stream's "config" event then brings the knobs up to date.
+//
+// "config" is how tabs sharing a room stay in step: the server sends the room's
+// knobs when the stream opens and again whenever anyone changes one. "viewers"
+// is the number of tabs currently watching the room.
 let roomBornMs = null;
 
 function connectStream() {
@@ -89,10 +93,16 @@ function connectStream() {
     const first = roomBornMs === null;
     const changed = !first && born !== roomBornMs;
     roomBornMs = born;
-    if (first) return; // config was just loaded or pushed by whoever connected us
     if (changed) postConfig();
-    else loadConfig();
   });
+  es.addEventListener("config", (e) => {
+    try {
+      applyConfig(JSON.parse(e.data));
+    } catch (err) {
+      /* ignore malformed frame */
+    }
+  });
+  es.addEventListener("viewers", (e) => showViewers(Number(e.data)));
   es.onerror = () => {
     // The browser retries a dropped connection by itself, but gives up for good
     // on an HTTP error — which is how the server answers a new room when it is
@@ -159,47 +169,81 @@ const cfgInputs = {
 
 // --- Config sync ------------------------------------------------------------
 
+// The server's knobs are the truth for the whole room, so every way of learning
+// them — the initial load, a stream "config" event, the answer to our own POST
+// — goes through applyConfig.
+let lastConfig = null;
+let pushing = 0; // config POSTs in flight
+
+function applyConfig(c) {
+  lastConfig = c;
+  // While our own change is on its way the server may still report the old
+  // value; its answer (or the next "config" event) will carry the merged result.
+  if (pushing > 0) return;
+  for (const key in cfgInputs) {
+    const input = cfgInputs[key];
+    if (c[key] === undefined) continue;
+    // Don't yank a field out from under someone typing in it (focused, and
+    // holding a value they haven't committed); it catches up when they commit
+    // or leave it.
+    if (input === document.activeElement && input.value !== input.dataset.synced) continue;
+    input.value = c[key];
+    input.dataset.synced = input.value;
+  }
+}
+
 async function loadConfig() {
   try {
-    const c = await (await fetch(withRoom("/api/config"))).json();
-    cfgInputs.shed_mode.value = c.shed_mode;
-    cfgInputs.max_qps.value = c.max_qps;
-    cfgInputs.inflight_quota.value = c.inflight_quota;
-    cfgInputs.queue_mode.value = c.queue_mode;
-    cfgInputs.queue_max.value = c.queue_max;
-    cfgInputs.deadline_mode.value = c.deadline_mode;
-    cfgInputs.margin_ms.value = c.margin_ms;
-    cfgInputs.latency_mode.value = c.latency_mode;
-    cfgInputs.latency_ms.value = c.latency_ms;
+    const res = await fetch(withRoom("/api/config"));
+    if (res.ok) applyConfig(await res.json());
   } catch (err) {
     /* keep the HTML defaults */
   }
 }
 
-async function postConfig() {
-  const body = {
-    shed_mode: cfgInputs.shed_mode.value,
-    max_qps: Number(cfgInputs.max_qps.value),
-    inflight_quota: Number(cfgInputs.inflight_quota.value),
-    queue_mode: cfgInputs.queue_mode.value,
-    queue_max: Number(cfgInputs.queue_max.value),
-    deadline_mode: cfgInputs.deadline_mode.value,
-    margin_ms: Number(cfgInputs.margin_ms.value),
-    latency_mode: cfgInputs.latency_mode.value,
-    latency_ms: Number(cfgInputs.latency_ms.value),
-  };
+// postConfig sends the named knobs, or all of them when called with none. A
+// single edit sends only its own knob: in a shared room the others may have
+// been changed by someone else since this tab last heard, and must not be
+// overwritten with what happens to be on screen here.
+async function postConfig(keys) {
+  const body = {};
+  for (const key of keys || Object.keys(cfgInputs)) {
+    const input = cfgInputs[key];
+    body[key] = input.type === "number" ? Number(input.value) : input.value;
+    input.dataset.synced = input.value; // committed: no longer an edit in progress
+  }
+  pushing++;
+  let merged = null;
   try {
-    await fetch(withRoom("/api/config"), {
+    const res = await fetch(withRoom("/api/config"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    if (res.ok) merged = await res.json();
   } catch (err) {
     /* ignore */
   }
+  pushing--;
+  if (merged) applyConfig(merged);
 }
 
-Object.values(cfgInputs).forEach((input) => (input.onchange = postConfig));
+for (const key in cfgInputs) {
+  const input = cfgInputs[key];
+  input.dataset.synced = input.value;
+  input.onchange = () => postConfig([key]);
+  // Leaving a field without changing it: show whatever arrived meanwhile.
+  input.onblur = () => {
+    if (lastConfig) setTimeout(() => applyConfig(lastConfig), 0);
+  };
+}
+
+function showViewers(n) {
+  const note = el("room-viewers");
+  note.hidden = !(n > 1);
+  note.textContent =
+    " " + n + " tabs are in this room. Backend knobs are shared between them; each tab that starts load adds its own.";
+}
 
 // --- Controls ---------------------------------------------------------------
 

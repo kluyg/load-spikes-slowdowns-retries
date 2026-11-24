@@ -35,6 +35,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -191,6 +192,9 @@ type roomState struct {
 	// lands in a brand-new room with default config. The metric stream reports
 	// bornMs on connect so the tab can tell that happened and re-apply its knobs.
 	bornMs int64
+
+	// viewers counts the open metric streams, i.e. tabs looking at this room.
+	viewers atomic.Int32
 
 	// sampler's previous cumulative values, for per-interval rates. Only the
 	// sampler goroutine touches these, so they need no synchronization.
@@ -634,12 +638,56 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, rs.config())
 		return
 	}
-	var c Config
-	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+	// A POST may carry any subset of the knobs, and only those are written.
+	// Tabs sharing a room each send just the knob that was touched, so one
+	// tab's stale view of the others can't overwrite a change made elsewhere.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.rdb.HSet(r.Context(), roomKey(room, "config"), map[string]any{
+	set, err := configUpdate(body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(set) > 0 {
+		if err := s.rdb.HSet(r.Context(), roomKey(room, "config"), set).Err(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	// Reflect immediately (the refresher keeps it in sync after that) and
+	// answer with the room's whole config so the tab can show the merged result.
+	merged := s.loadConfig(r.Context(), room)
+	rs.cfgPtr.Store(&merged)
+	writeJSON(w, merged)
+}
+
+// configUpdate turns a config POST body into the Redis fields to write: exactly
+// the knobs the body names, type-checked against Config, and nothing else.
+func configUpdate(body []byte) (map[string]any, error) {
+	var present map[string]json.RawMessage
+	var c Config
+	if err := json.Unmarshal(body, &present); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(body, &c); err != nil {
+		return nil, err
+	}
+	set := map[string]any{}
+	for k, v := range configFields(c) {
+		if _, ok := present[k]; ok {
+			set[k] = v
+		}
+	}
+	return set, nil
+}
+
+// configFields maps a Config to the field names it is stored under in Redis,
+// which are also its JSON names.
+func configFields(c Config) map[string]any {
+	return map[string]any{
 		"queue_mode":     c.QueueMode,
 		"queue_max":      c.QueueMax,
 		"deadline_mode":  c.DeadlineMode,
@@ -649,12 +697,7 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"shed_mode":      c.ShedMode,
 		"max_qps":        c.MaxQPS,
 		"inflight_quota": c.InflightQuota,
-	}).Err(); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
 	}
-	rs.cfgPtr.Store(&c) // reflect immediately; refresher keeps it in sync
-	writeJSON(w, c)
 }
 
 // handleMetrics returns the room's latest snapshot as plain JSON (handy for
@@ -696,6 +739,16 @@ func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "event: hello\ndata: {\"born_ms\":%d}\n\n", rs.bornMs)
 	flusher.Flush()
 
+	rs.viewers.Add(1)
+	defer rs.viewers.Add(-1)
+
+	// Besides the metric snapshots, the stream carries the room's knobs and how
+	// many tabs are watching, each sent on the first tick and then only when it
+	// changes. That is what keeps every tab in a shared room showing the same
+	// knobs: a change made in one reaches the others within a tick.
+	var sentCfg *Config
+	sentViewers := int32(-1)
+
 	t := time.NewTicker(sampleInterval)
 	defer t.Stop()
 	for {
@@ -705,12 +758,20 @@ func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
 		case <-t.C:
 			// An open stream keeps the room alive even when load is stopped.
 			s.touch(r.Context(), room)
-			snap := rs.m.latest.Load()
-			if snap == nil {
-				continue
+			if cfg := rs.config(); sentCfg == nil || *sentCfg != cfg {
+				b, _ := json.Marshal(cfg)
+				fmt.Fprintf(w, "event: config\ndata: %s\n\n", b)
+				sentCfg = &cfg
 			}
-			b, _ := json.Marshal(snap)
-			fmt.Fprintf(w, "data: %s\n\n", b)
+			if v := rs.viewers.Load(); v != sentViewers {
+				fmt.Fprintf(w, "event: viewers\ndata: %d\n\n", v)
+				sentViewers = v
+			}
+			snap := rs.m.latest.Load()
+			if snap != nil {
+				b, _ := json.Marshal(snap)
+				fmt.Fprintf(w, "data: %s\n\n", b)
+			}
 			flusher.Flush()
 		}
 	}
