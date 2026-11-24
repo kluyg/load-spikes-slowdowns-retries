@@ -102,6 +102,13 @@ backend completed). **Goodput** is measured in the client, where success is
 actually observed. The hero chart overlays throughput and goodput — under
 overload, throughput stays flat while goodput falls off a cliff.
 
+**Client latency (p50 / p99)** is also measured in the client: the time from a
+logical request starting to its answer arriving, including every failed attempt
+and backoff sleep in between. Percentiles are taken over each one-second window
+of *successful* requests, so a second in which nothing succeeds shows as a gap
+rather than a number. Because the client polls every 250 ms, observed latency
+moves in roughly 250 ms steps and never drops below one poll interval.
+
 ## What it demonstrates
 
 The whole arc, each step reproducible from a preset and verified with a headless

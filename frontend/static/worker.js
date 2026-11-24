@@ -66,13 +66,19 @@ function clearTimers() {
 
 // runLogicalRequest drives one user request through attempts under the retry
 // policy. Each retry is a fresh StartWork — that is the new load retries add.
+//
+// Latency is measured here, where the user would feel it: from the moment the
+// logical request starts to the moment its answer is in hand, so it includes
+// every failed attempt and every backoff sleep along the way. Only successes
+// report a latency — a request that gave up has no answer to time.
 async function runLogicalRequest() {
   self.postMessage({ type: "started" });
+  const startedAt = performance.now();
   let attempt = 0;
   while (true) {
     const result = await oneAttempt();
     if (result === "ok") {
-      self.postMessage({ type: "completed" });
+      self.postMessage({ type: "completed", latencyMs: performance.now() - startedAt });
       return;
     }
     // Honor backpressure: a shed (429) means "stop", not "retry harder". Only
