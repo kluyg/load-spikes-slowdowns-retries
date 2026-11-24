@@ -31,6 +31,22 @@ simulation.
 - **Redis** — the single backbone: work queue (list), completion bus (pub/sub),
   live config (hash), and metric counters.
 
+### Rooms (multi-user isolation)
+
+Every browser gets an isolated **room** — its id lives in the URL hash
+(`#room=<id>`), so a room is bookmarkable and shareable. All of a room's state
+lives under `room:<id>:` Redis keys (queue, config, metrics, completion bus),
+and — crucially — the backend runs a **dedicated worker pool per room**. Sharing
+capacity would ruin the whole point (the ~80 ops/s number only means anything
+per-tenant), so two people driving the deployed system at once get fully
+independent systems: separate knobs, separate graphs, separate capacity.
+
+A room stays alive while the frontend keeps its entry fresh in a `rooms` sorted
+set (on every RPC and each metric-stream tick). The backend polls that set and
+spins a pool up when a room appears, tearing it down a few seconds after the tab
+goes away; a frontend janitor then deletes the room's keys. Open the page twice
+for two independent systems, or share a `#room=` link to watch one together.
+
 The request flow is the Long-Running-Operation poll pattern: `StartWork` returns
 an operation id; the client polls `GetOperation` until it's done or the client's
 deadline passes. Capacity ≈ workers ÷ latency = 4 ÷ 50 ms ≈ **80 ops/s**.
@@ -150,5 +166,10 @@ shedding also prevents the retry storm from forming in the first place.
   exact overload these metrics exist to measure.
 - **Redis is the only broker:** work queue, completion bus, config, and metrics
   all live in it, which keeps the moving parts minimal.
+- **Rooms are just a key prefix plus a pool per room.** Isolation costs almost
+  nothing structurally — every room's state is `room:<id>:…` keys and the
+  backend scales workers with the number of live rooms. Idle rooms are garbage
+  collected; the only thing left to expire on its own is the per-op `done`
+  marker (a 1 h TTL key), which is cheap.
 - **Determinism caveat:** this is a real system, not a simulation, so absolute
   numbers vary run to run; the *shapes* and orderings are the point.

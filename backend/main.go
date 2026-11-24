@@ -1,17 +1,30 @@
-// Command backend consumes work items from the Redis work queue, simulates
-// doing the work, and publishes a completion notification so the frontend can
-// answer GetOperation calls.
+// Command backend consumes work items and simulates doing them, publishing a
+// completion so the frontend can answer GetOperation calls.
 //
-// Its behavior is live-tunable via a Redis config hash:
+// Every user gets an isolated "room": a namespace of Redis keys plus its own
+// dedicated worker pool, so two people driving the deployed system concurrently
+// never share a queue, config, metrics, or — crucially — capacity. The demo's
+// headline number (capacity = workers / latency ≈ 80 ops/s) only holds if each
+// room owns its own workers, so we spin up CONCURRENCY workers *per active
+// room* rather than one global pool.
+//
+// A room is "active" while the frontend keeps its score fresh in the `rooms`
+// sorted set (it does so on every RPC and on each metric-stream tick). This
+// manager polls that set: a freshly-seen room gets a pool; a room whose score
+// goes stale gets its pool torn down. The frontend deletes a room's keys a few
+// seconds *after* we stop its workers (see roomIdleStop vs. the frontend's GC
+// window), so workers never write to keys that are about to be deleted.
+//
+// Each pool's behavior is live-tunable via the room's config hash:
 //   - queue discipline:  FIFO (serve oldest) vs LIFO (serve newest)
 //   - deadline propagation: none / drop-if-expired / drop-if-no-margin
 //   - latency distribution: uniform vs long-tail (mean-preserving lognormal)
 //
-// It also honors a short-lived 4x latency spike. This reproduces the
-// dynamics from https://strebkov.dev/posts/shed-your-load/ : under overload,
-// FIFO serves work whose clients already gave up (throughput stays flat, goodput
-// collapses), LIFO serves the freshest work, and a deadline margin refuses work
-// it can't finish in time rather than discovering the waste afterward.
+// It also honors a short-lived 4x latency spike. This reproduces the dynamics
+// from https://strebkov.dev/posts/shed-your-load/ : under overload, FIFO serves
+// work whose clients already gave up (throughput stays flat, goodput collapses),
+// LIFO serves the freshest work, and a deadline margin refuses work it can't
+// finish in time rather than discovering the waste afterward.
 package main
 
 import (
@@ -22,7 +35,6 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,22 +42,19 @@ import (
 )
 
 const (
-	workQueueKey    = "work:queue"
-	completionChan  = "completions"
-	configKey       = "config"
-	latencyUntilKey = "chaos:latency_until_ms"
-	inflightKey     = "metric:inflight"        // durable gauge (frontend INCRs, we DECR)
-	throughputKey   = "metric:throughput_total" // durable counter of work done
-	latencyMult     = 4
-	longtailSigma   = 0.9 // spread of the long-tail lognormal
+	roomsKey      = "rooms" // ZSET: room id -> last-activity unix ms (maintained by the frontend)
+	latencyMult   = 4
+	longtailSigma = 0.9 // spread of the long-tail lognormal
+	// A room stops being served roomIdleStop after its last activity. This is
+	// deliberately shorter than the frontend's key-GC window so a room's workers
+	// are gone before its keys are deleted.
+	roomIdleStop = 15 * time.Second
+	managePeriod = 500 * time.Millisecond
 )
 
-// latencyUntilMs caches the latency-spike deadline; cfgPtr caches the live knobs.
-// Both are refreshed by refreshState so the hot path never blocks on Redis.
-var (
-	latencyUntilMs atomic.Int64
-	cfgPtr         atomic.Pointer[Config]
-)
+// roomKey builds the Redis key for a per-room datum. Everything a room touches
+// lives under "room:<id>:" so rooms never collide.
+func roomKey(room, name string) string { return "room:" + room + ":" + name }
 
 // Config holds the live-tunable backend knobs.
 type Config struct {
@@ -60,13 +69,6 @@ func defaultConfig() Config {
 	return Config{QueueMode: "FIFO", DeadlineMode: "none", MarginMs: 70, LatencyMode: "uniform", LatencyMs: 50}
 }
 
-func currentConfig() Config {
-	if c := cfgPtr.Load(); c != nil {
-		return *c
-	}
-	return defaultConfig()
-}
-
 type workItem struct {
 	ID         string `json:"id"`
 	EnqueuedMs int64  `json:"enqueued_ms"`
@@ -78,6 +80,22 @@ type completion struct {
 	Status string `json:"status"` // "done" | "dropped"
 }
 
+// roomPool is one room's dedicated slice of capacity: CONCURRENCY workers plus a
+// refresher, all under ctx. cfgPtr/latencyUntilMs cache the room's live state so
+// the workers never hit Redis on the hot path.
+//
+// Each pool owns its own Redis client. An idle worker parks in a blocking pop,
+// holding a connection for the whole wait, so a client shared across rooms runs
+// out of connections once enough rooms are open (go-redis defaults to
+// 10 x GOMAXPROCS, i.e. 10 on a 1-vCPU host) — and then idle rooms starve busy
+// ones, which is exactly the cross-room interference rooms exist to prevent.
+type roomPool struct {
+	cancel         context.CancelFunc
+	rdb            *redis.Client
+	cfgPtr         atomic.Pointer[Config]
+	latencyUntilMs atomic.Int64
+}
+
 func main() {
 	addr := getenv("REDIS_ADDR", "localhost:6379")
 	concurrency := getenvInt("CONCURRENCY", 4)
@@ -85,42 +103,97 @@ func main() {
 	rdb := redis.NewClient(&redis.Options{Addr: addr})
 	ctx := context.Background()
 
-	log.Printf("backend starting: concurrency=%d redis=%s", concurrency, addr)
-
-	go refreshState(ctx, rdb)
-
-	var wg sync.WaitGroup
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			runWorker(ctx, rdb)
-		}()
-	}
-	wg.Wait()
+	log.Printf("backend starting: concurrency=%d/room redis=%s", concurrency, addr)
+	manageRooms(ctx, rdb, addr, concurrency)
 }
 
-// refreshState keeps the local view of config + latency spike up to date so the
-// workers don't hit Redis on every item.
-func refreshState(ctx context.Context, rdb *redis.Client) {
-	t := time.NewTicker(250 * time.Millisecond)
+// manageRooms polls the `rooms` set and keeps one pool alive per active room:
+// start a pool the first time a room appears, cancel it once the room goes stale.
+func manageRooms(ctx context.Context, rdb *redis.Client, addr string, concurrency int) {
+	pools := map[string]*roomPool{}
+	t := time.NewTicker(managePeriod)
 	defer t.Stop()
 	for {
-		cfg := loadConfig(ctx, rdb)
-		cfgPtr.Store(&cfg)
+		cutoff := time.Now().Add(-roomIdleStop).UnixMilli()
+		active, err := rdb.ZRangeByScore(ctx, roomsKey, &redis.ZRangeBy{
+			Min: strconv.FormatInt(cutoff, 10),
+			Max: "+inf",
+		}).Result()
+		if err != nil {
+			log.Printf("rooms poll error: %v", err)
+			<-t.C
+			continue
+		}
 
-		if v, err := rdb.Get(ctx, latencyUntilKey).Int64(); err == redis.Nil {
-			latencyUntilMs.Store(0)
-		} else if err == nil {
-			latencyUntilMs.Store(v)
+		activeSet := make(map[string]bool, len(active))
+		for _, room := range active {
+			activeSet[room] = true
+			if pools[room] == nil {
+				pools[room] = startPool(ctx, addr, room, concurrency)
+				log.Printf("room %s: pool up (%d workers)", room, concurrency)
+			}
+		}
+		for room, p := range pools {
+			if !activeSet[room] {
+				p.stop()
+				delete(pools, room)
+				log.Printf("room %s: pool down (idle)", room)
+			}
 		}
 		<-t.C
 	}
 }
 
-func loadConfig(ctx context.Context, rdb *redis.Client) Config {
+func startPool(parent context.Context, addr, room string, concurrency int) *roomPool {
+	ctx, cancel := context.WithCancel(parent)
+	// One connection per worker (each may be parked in a blocking pop) plus
+	// headroom for the refresher, so nothing in this room ever waits on the pool.
+	rdb := redis.NewClient(&redis.Options{Addr: addr, PoolSize: concurrency + 2})
+	p := &roomPool{cancel: cancel, rdb: rdb}
 	c := defaultConfig()
-	m, err := rdb.HGetAll(ctx, configKey).Result()
+	p.cfgPtr.Store(&c)
+
+	go refreshRoomState(ctx, rdb, room, p)
+	for i := 0; i < concurrency; i++ {
+		go runWorker(ctx, rdb, room, p)
+	}
+	return p
+}
+
+// stop tears the pool down. Closing the client also breaks workers out of a
+// blocking pop immediately; otherwise one could sit there for seconds after the
+// cancel and swallow an item enqueued for the room's next pool.
+func (p *roomPool) stop() {
+	p.cancel()
+	p.rdb.Close()
+}
+
+// refreshRoomState keeps a pool's cached config + latency-spike deadline current
+// so its workers don't hit Redis per item. It exits when the pool is cancelled.
+func refreshRoomState(ctx context.Context, rdb *redis.Client, room string, p *roomPool) {
+	t := time.NewTicker(250 * time.Millisecond)
+	defer t.Stop()
+	for {
+		cfg := loadConfig(ctx, rdb, room)
+		p.cfgPtr.Store(&cfg)
+
+		if v, err := rdb.Get(ctx, roomKey(room, "chaos:latency_until_ms")).Int64(); err == redis.Nil {
+			p.latencyUntilMs.Store(0)
+		} else if err == nil {
+			p.latencyUntilMs.Store(v)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+func loadConfig(ctx context.Context, rdb *redis.Client, room string) Config {
+	c := defaultConfig()
+	m, err := rdb.HGetAll(ctx, roomKey(room, "config")).Result()
 	if err != nil {
 		return c
 	}
@@ -142,9 +215,12 @@ func loadConfig(ctx context.Context, rdb *redis.Client) Config {
 	return c
 }
 
-func runWorker(ctx context.Context, rdb *redis.Client) {
+func runWorker(ctx context.Context, rdb *redis.Client, room string, p *roomPool) {
+	queueKey := roomKey(room, "work:queue")
+	inflightKey := roomKey(room, "metric:inflight")
+	throughputKey := roomKey(room, "metric:throughput_total")
 	for {
-		cfg := currentConfig()
+		cfg := *p.cfgPtr.Load()
 
 		// FIFO: frontend LPUSHes (head), so BRPOP takes the oldest from the tail.
 		// LIFO: BLPOP takes the newest from the head. LIFO is a no-op until the
@@ -152,9 +228,12 @@ func runWorker(ctx context.Context, rdb *redis.Client) {
 		var res []string
 		var err error
 		if cfg.QueueMode == "LIFO" {
-			res, err = rdb.BLPop(ctx, 5*time.Second, workQueueKey).Result()
+			res, err = rdb.BLPop(ctx, 5*time.Second, queueKey).Result()
 		} else {
-			res, err = rdb.BRPop(ctx, 5*time.Second, workQueueKey).Result()
+			res, err = rdb.BRPop(ctx, 5*time.Second, queueKey).Result()
+		}
+		if ctx.Err() != nil {
+			return // pool cancelled (room went idle)
 		}
 		if err == redis.Nil {
 			continue
@@ -188,24 +267,27 @@ func runWorker(ctx context.Context, rdb *redis.Client) {
 		}
 		if drop {
 			rdb.Decr(ctx, inflightKey)
-			publish(ctx, rdb, item.ID, "dropped")
+			publish(ctx, rdb, room, item.ID, "dropped")
 			continue
 		}
 
-		time.Sleep(sampleLatency(cfg))
+		time.Sleep(sampleLatency(cfg, p))
+		if ctx.Err() != nil {
+			return // pool cancelled mid-item; the room's keys are about to be deleted
+		}
 
-		if err := rdb.Set(ctx, "op:"+item.ID, "done", time.Hour).Err(); err != nil {
+		if err := rdb.Set(ctx, roomKey(room, "op:"+item.ID), "done", time.Hour).Err(); err != nil {
 			log.Printf("set error: %v", err)
 		}
 		rdb.Incr(ctx, throughputKey)
 		rdb.Decr(ctx, inflightKey)
-		publish(ctx, rdb, item.ID, "done")
+		publish(ctx, rdb, room, item.ID, "done")
 	}
 }
 
 // sampleLatency returns the simulated service time, including a long-tail draw
 // and the 4x spike multiplier when active.
-func sampleLatency(cfg Config) time.Duration {
+func sampleLatency(cfg Config, p *roomPool) time.Duration {
 	base := float64(cfg.LatencyMs)
 	ms := base
 	if cfg.LatencyMode == "longtail" {
@@ -214,15 +296,15 @@ func sampleLatency(cfg Config) time.Duration {
 		ms = base * math.Exp(longtailSigma*rand.NormFloat64()-longtailSigma*longtailSigma/2)
 	}
 	d := time.Duration(ms) * time.Millisecond
-	if time.Now().UnixMilli() < latencyUntilMs.Load() {
+	if time.Now().UnixMilli() < p.latencyUntilMs.Load() {
 		d *= latencyMult
 	}
 	return d
 }
 
-func publish(ctx context.Context, rdb *redis.Client, id, status string) {
+func publish(ctx context.Context, rdb *redis.Client, room, id, status string) {
 	b, _ := json.Marshal(completion{ID: id, Status: status})
-	rdb.Publish(ctx, completionChan, b)
+	rdb.Publish(ctx, roomKey(room, "completions"), b)
 }
 
 func getenv(key, def string) string {

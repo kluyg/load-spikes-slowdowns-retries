@@ -29,6 +29,8 @@
     header { padding: 20px 24px; border-bottom: 1px solid var(--border); }
     header h1 { margin: 0; font-size: 18px; font-weight: 600; }
     header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+    header p.room code { color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+    header p.room a { color: var(--accent); }
     main { padding: 24px; max-width: 1040px; margin: 0 auto; }
     .panel {
       background: var(--panel);
@@ -98,6 +100,7 @@
   <header>
     <h1>Load Spikes, Slowdowns &amp; Retries</h1>
     <p>Backend knobs &mdash; reproduce the throughput-vs-goodput dynamics from "Shed your load." Capacity &approx; 80 ops/s (4 workers &times; 50&nbsp;ms).</p>
+    <p class="room">Room <code id="room-id"></code> &mdash; <a id="room-link" href="#">shareable link</a>. Each room is an isolated system with its own capacity; open the page in a new tab for a fresh one.</p>
   </header>
   <main>
     <div class="panel">
