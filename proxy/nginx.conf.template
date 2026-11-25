@@ -5,6 +5,12 @@ load_module modules/ngx_http_acme_module.so;
 
 worker_processes auto;
 
+# Each proxied request holds two descriptors, one to the client and one to the
+# frontend, and idle upstream connections are kept open on top of that.
+# Docker's default soft limit of 1024 runs out under a retry storm, and nginx
+# then fails requests with "No file descriptors available".
+worker_rlimit_nofile 16384;
+
 events {
 	worker_connections 8192;
 }
@@ -17,8 +23,10 @@ http {
 
 	# Docker's embedded DNS. The ACME client needs a resolver to reach Let's
 	# Encrypt, and the upstream below uses it to follow the frontend container
-	# to a new address when a deploy recreates it.
-	resolver 127.0.0.11 valid=10s;
+	# to a new address when a deploy recreates it. IPv4 only: the default
+	# Docker network has no IPv6 route, and without this the ACME client tries
+	# Let's Encrypt's IPv6 address first and logs an error before falling back.
+	resolver 127.0.0.11 valid=10s ipv6=off;
 
 	acme_issuer letsencrypt {
 		uri https://acme-v02.api.letsencrypt.org/directory;

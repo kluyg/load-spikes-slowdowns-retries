@@ -13,10 +13,10 @@ out of the system being demonstrated; see [Why nginx](#why-nginx) below.
 ## 1. Create the Droplet (DigitalOcean web console)
 
 - **Image:** Ubuntu 24.04 (LTS) x64
-- **Plan:** Basic → Regular → **$18/mo (2 GB / 2 vCPU)**. The $6 plan
-  (1 GB / 1 vCPU) runs the stack, but at the peak of the retry-storm scenarios
-  the frontend, proxy, Redis and backend together want more than one core, so
-  the numbers fall short of the README's.
+- **Plan:** Basic → Regular → **$18/mo (2 GB / 2 vCPU)** is what the numbers
+  [below](#what-the-2-vcpu-droplet-delivers) were measured on. The $6 plan
+  (1 GB / 1 vCPU) runs the stack, but the retry-storm scenarios already use
+  both cores of the larger one.
 - **Region:** closest to you (or to your users). Not every datacenter offers
   every Basic Regular plan; if the one you want shows as unavailable, pick
   another datacenter in the same city.
@@ -133,8 +133,8 @@ on other cores and no network in between:
 | nginx, this configuration | 54% | 72 ops/s | 17% / 39% of a core |
 | Caddy, upstream keep-alive pool raised | 51–52% | 64–68 ops/s | 50% / 95% |
 
-Two settings matter more than the choice of proxy, and
-`proxy/nginx.conf.template` sets both:
+Three settings matter more than the choice of proxy, and
+`proxy/nginx.conf.template` sets all of them:
 
 - **Reuse connections to the frontend.** A proxy that keeps only a few idle
   upstream connections dials a new one for most polls. Caddy's default of 32
@@ -143,6 +143,30 @@ Two settings matter more than the choice of proxy, and
 - **Don't cap requests per client connection.** A tab makes all its requests
   over one HTTP/2 connection; nginx's default limit of 1000 requests would
   force a reconnect and a new TLS handshake every few seconds.
+- **Raise the open-file limit.** Docker starts nginx's workers with a soft
+  limit of 1024 descriptors. The heaviest scenarios need more, and at the
+  limit nginx fails requests instead of passing them to the frontend.
+
+## What the 2-vCPU Droplet delivers
+
+The same scenario against the live Droplet (SFO2, Basic 2 vCPU / 2 GB), with
+the load generator on a home connection 30 to 55 ms away:
+
+| Entry point on the Droplet | Total goodput | Goodput in the spike | After the spike |
+|---|---|---|---|
+| Tailscale Funnel sidecar (the previous setup) | 22–28% | 30–35 ops/s | never recovers |
+| nginx, this configuration | 41–43% | 45–50 ops/s | recovers in 4–6 s |
+
+During the storm nginx used 40% of a core on average and about 80% at its
+peak, where the sidecar had used 90 to 110% and up to 170%.
+
+The scenarios without a retry storm match the README on this Droplet:
+Deadline + margin without retries reaches 72 ops/s in the spike, and load
+shedding 76 ops/s. Deadline + margin *with* retry ×5 stops at 45 to 50 ops/s
+against the README's 73, because for about 12 seconds the host has no idle CPU
+left: roughly 50% user, 29% system and 20% softirq, with under 1% stolen by
+the hypervisor. The README's figure for that scenario needs more CPU than this
+plan has.
 
 ## Multiple concurrent users
 
