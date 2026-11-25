@@ -1,0 +1,74 @@
+# Rendered to /etc/nginx/nginx.conf at container start; ${SITE_ADDRESS} is the
+# only variable substituted (see NGINX_ENVSUBST_FILTER in docker-compose.yml).
+
+load_module modules/ngx_http_acme_module.so;
+
+worker_processes auto;
+
+events {
+	worker_connections 8192;
+}
+
+http {
+	# No access log, no compression: the API traffic is thousands of tiny JSON
+	# responses a second, and on a small host every bit of CPU the proxy uses
+	# comes out of the system being demonstrated.
+	access_log off;
+
+	# Docker's embedded DNS. The ACME client needs a resolver to reach Let's
+	# Encrypt, and the upstream below uses it to follow the frontend container
+	# to a new address when a deploy recreates it.
+	resolver 127.0.0.11 valid=10s;
+
+	acme_issuer letsencrypt {
+		uri https://acme-v02.api.letsencrypt.org/directory;
+		state_path /var/lib/nginx-acme;
+		accept_terms_of_service;
+	}
+	acme_shared_zone zone=acme:1m;
+
+	upstream frontend {
+		zone frontend 64k;
+		server frontend:8080 resolve;
+		# Keep connections to the frontend open and reuse them. Under a retry
+		# storm a proxy that dials per request spends most of its CPU in
+		# connect() and can run the host out of ephemeral ports.
+		keepalive 1024;
+		keepalive_requests 1000000;
+	}
+
+	# A browser tab polls thousands of times a minute over one HTTP/2
+	# connection; the default of 1000 requests would make it reconnect, with a
+	# new TLS handshake, every few seconds.
+	keepalive_requests 1000000;
+
+	server {
+		listen 80;
+		server_name ${SITE_ADDRESS};
+		# The ACME module answers Let's Encrypt's HTTP-01 challenges on this
+		# port by itself; everything else is sent to HTTPS.
+		return 308 https://$host$request_uri;
+	}
+
+	server {
+		listen 443 ssl;
+		http2 on;
+		server_name ${SITE_ADDRESS};
+
+		acme_certificate letsencrypt;
+		ssl_certificate $acme_certificate;
+		ssl_certificate_key $acme_certificate_key;
+		ssl_certificate_cache max=2;
+
+		location / {
+			proxy_pass http://frontend;
+			proxy_http_version 1.1;
+			proxy_set_header Connection "";
+			proxy_set_header Host $host;
+			# Pass each response through as it arrives, so the metrics stream
+			# (text/event-stream) is not held back in a buffer.
+			proxy_buffering off;
+			proxy_read_timeout 1h;
+		}
+	}
+}

@@ -70,11 +70,9 @@ docker compose up --build
 No keys or external accounts needed — this is the full local stack. Then open
 <http://localhost:8080>.
 
-> Optional: `docker compose --profile tailnet up` also starts a Tailscale sidecar
-> that serves the frontend on your tailnet (proxying to `frontend:8080` over the
-> Docker network). It needs `TS_AUTHKEY` in a gitignored `.env`; stop it with
-> `docker compose --profile tailnet down`. To host a durable public instance, see
-> [DEPLOY.md](DEPLOY.md).
+> To host a durable public instance over HTTPS, see [DEPLOY.md](DEPLOY.md):
+> `docker compose --profile public up` adds an nginx reverse proxy that gets its
+> own Let's Encrypt certificate.
 
 ## Try it: scenarios
 

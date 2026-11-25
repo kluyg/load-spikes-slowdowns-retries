@@ -1,39 +1,47 @@
-# Deploying a durable public instance (DigitalOcean + Tailscale Funnel)
+# Deploying a durable public instance (DigitalOcean + nginx + Let's Encrypt)
 
-The laptop-served Funnel URL is only live while your machine is awake. For a
-durable public link, run the same compose on a small always-on Droplet. Tailscale Funnel gives free HTTPS and needs **no inbound ports** open
-(ingress arrives over Tailscale's own connection), so the box's only exposed
-port is SSH. The compose file publishes Redis (6379) and the frontend (8080) on
-`127.0.0.1` only, which is what keeps that true: Docker's port publishing
-bypasses `ufw`, so a port published on all interfaces would be reachable from
-the internet no matter what the host firewall says.
+`docker compose up` serves the demo on `localhost` only. For a public link, run
+the same compose file on a small always-on Droplet with the `public` profile.
+That adds one container, an nginx reverse proxy that terminates HTTPS on ports
+80 and 443 and gets and renews its own Let's Encrypt certificate. The frontend
+(8080) and Redis (6379) stay published on `127.0.0.1` only.
+
+The proxy is deliberately a thin one. This demo's traffic is thousands of tiny
+polling requests a second, so whatever CPU the entry point uses comes straight
+out of the system being demonstrated; see [Why nginx](#why-nginx) below.
 
 ## 1. Create the Droplet (DigitalOcean web console)
 
 - **Image:** Ubuntu 24.04 (LTS) x64
-- **Plan:** Basic → Regular → **$6/mo (1 GB / 1 vCPU)**. 1 GB matters only so the
-  in-VM Go build doesn't OOM; the running stack uses far less.
+- **Plan:** Basic → Regular → **$18/mo (2 GB / 2 vCPU)**. The $6 plan
+  (1 GB / 1 vCPU) runs the stack, but at the peak of the retry-storm scenarios
+  the frontend, proxy, Redis and backend together want more than one core, so
+  the numbers fall short of the README's.
 - **Region:** closest to you (or to your users). Not every datacenter offers
-  the Basic Regular plans; if the $6 plan shows as unavailable (NYC2 did in
-  November 2026), pick another datacenter in the same city, such as NYC3.
+  every Basic Regular plan; if the one you want shows as unavailable, pick
+  another datacenter in the same city.
 - **Auth:** add your SSH key.
 - Create, and note the Droplet's IP.
 
-Optionally add a DigitalOcean Cloud Firewall allowing **inbound SSH (22) only**
-(leave all outbound open). Funnel needs nothing else inbound.
+## 2. Point a hostname at it
 
-## 2. Get a Tailscale auth key
+Add an `A` record for the name you want (a subdomain is enough) with the
+Droplet's IP as its value. If the DNS provider can also proxy traffic
+(Cloudflare's orange cloud), turn that off for this record: Let's Encrypt has
+to reach nginx directly, and so should the visitors.
 
-Tailscale admin console → **Settings → Keys → Generate auth key**:
-- **Reusable:** on (so you can re-run the deploy)
-- **Ephemeral:** off (the node should persist)
-- Copy the `tskey-auth-...` value.
+## 3. Firewall
 
-Funnel is already enabled on your tailnet (the laptop used it), so the new node
-inherits it. If Funnel doesn't turn on, check the ACL `nodeAttrs` grant for
-`funnel` covers this node.
+Add a DigitalOcean Cloud Firewall to the Droplet allowing **inbound TCP 22, 80
+and 443** and all outbound. Port 80 has to stay open: Let's Encrypt validates
+the hostname over it, at first issue and at every renewal.
 
-## 3. Bring it up on the Droplet
+Use the Cloud Firewall rather than `ufw` on the host. Docker's port publishing
+bypasses `ufw`, so a port published on all interfaces is reachable from the
+internet no matter what the host firewall says. That is also why the compose
+file binds Redis and the frontend to `127.0.0.1`.
+
+## 4. Bring it up on the Droplet
 
 ```sh
 ssh root@<DROPLET_IP>
@@ -45,48 +53,96 @@ curl -fsSL https://get.docker.com | sh
 git clone https://github.com/kluyg/load-spikes-slowdowns-retries.git
 cd load-spikes-slowdowns-retries
 
-# Tailscale auth key (gitignored, never committed)
-printf 'TS_AUTHKEY=tskey-auth-XXXXXXXX\n' > .env
-chmod 600 .env
+# The public hostname (gitignored, never committed)
+printf 'SITE_ADDRESS=demo.example.com\n' > .env
 
-# Full stack, public via Funnel
-docker compose --profile tailnet up -d --build
+# Full stack, public over HTTPS
+docker compose --profile public up -d --build
 ```
 
-## 4. Claim the canonical URL (optional but tidy)
-
-If another machine on your tailnet already holds the name `frontend` (the
-laptop you tested from, or an earlier Droplet that has since been destroyed),
-the new node registers as `frontend-1` and serves at
-`https://frontend-1.<tailnet>.ts.net`. To serve at
-`https://frontend.<tailnet>.ts.net` instead:
-
-1. If the old node is your laptop, stop its sidecar first:
-
-   ```sh
-   # on your laptop:
-   docker compose --profile tailnet down
-   ```
-2. In the Tailscale admin console → **Machines**, open the old `frontend`
-   node's **⋯** menu and choose **Remove**.
-3. On the same page, open the **⋯** menu of `frontend-1` → **Edit machine
-   name**, turn off **Auto-generate from OS hostname**, and set the name to
-   `frontend`.
-
-The rename is needed: once a node has been given `frontend-1`, restarting the
-sidecar keeps that name even after `frontend` is free. Funnel follows the new
-name within a few seconds, and the `frontend-1` URL stops working. To skip the
-rename altogether, do steps 1 and 2 before the first
-`docker compose --profile tailnet up` on the Droplet.
+The first start requests the certificate, which takes well under a minute.
+Until it arrives, HTTPS connections fail. The certificate and the ACME account
+key live in the `acme-state` volume; keep it across redeploys, because Let's
+Encrypt limits how often it will issue for the same hostname.
 
 ## 5. Verify
 
 ```sh
-docker compose --profile tailnet exec ts-frontend tailscale funnel status
+curl -sI https://demo.example.com/ | head -1      # HTTP/2 200
+docker compose --profile public logs proxy        # if not: issuance errors show here
 ```
-Prints the public URL. Open it from a phone on cellular (off any tailnet) to
-confirm it's truly public. `restart: unless-stopped` keeps the stack up across
-reboots.
+
+Then open the URL in a browser. `restart: unless-stopped` keeps the stack up
+across reboots.
+
+To measure what the deployment can do, run the load generator against it from
+another machine and compare with the README's tables:
+
+```sh
+cd loadgen && go build -o loadgen . && ./loadgen -url https://demo.example.com
+```
+
+## 6. Redeploying
+
+By hand, on the Droplet:
+
+```sh
+./deploy.sh
+```
+
+It fast-forwards the checkout to `origin/main`, rebuilds and restarts what
+changed, and waits for the site to answer. A deploy restarts the frontend, so
+open tabs lose their room and reconnect to a fresh one.
+
+### From GitHub Actions
+
+`.github/workflows/deploy.yml` runs the same script over SSH each time CI
+passes on `main` (and on demand, from the Actions tab). It stays inactive until
+the repository has a `DEPLOY_HOST` variable. To set it up:
+
+1. On the Droplet, create a key pair for deploys only, and allow it to do
+   nothing but run the script:
+
+   ```sh
+   ssh-keygen -t ed25519 -N '' -C github-actions-deploy -f /root/deploy_key
+   printf 'restrict,command="/root/load-spikes-slowdowns-retries/deploy.sh" %s\n' \
+     "$(cat /root/deploy_key.pub)" >> /root/.ssh/authorized_keys
+   ```
+
+   `restrict` plus a forced command means that whoever holds this key can
+   trigger a deploy of a commit that is already on `main`, and nothing else:
+   no shell, no port forwarding, no file copy.
+2. In the GitHub repository, under **Settings → Secrets and variables →
+   Actions**:
+   - secret `DEPLOY_SSH_KEY`: the contents of `/root/deploy_key`
+   - variable `DEPLOY_HOST`: the hostname from step 2
+   - variable `DEPLOY_KNOWN_HOSTS`: the output of
+     `ssh-keyscan -t ed25519 <hostname>`, run from a machine that already
+     trusts the Droplet
+3. Delete `/root/deploy_key` from the Droplet (the `.pub` half can stay).
+
+## Why nginx
+
+Measured with `loadgen -scenario margin-retry` (spike with immediate retry ×5,
+Deadline + margin) against the stack pinned to 2 CPUs, with the load generator
+on other cores and no network in between:
+
+| Entry point | Total goodput | Goodput in the spike | Its CPU, average / peak |
+|---|---|---|---|
+| none (plain HTTP to the frontend) | 55% | 73 ops/s | |
+| nginx, this configuration | 54% | 72 ops/s | 17% / 39% of a core |
+| Caddy, upstream keep-alive pool raised | 51–52% | 64–68 ops/s | 50% / 95% |
+
+Two settings matter more than the choice of proxy, and
+`proxy/nginx.conf.template` sets both:
+
+- **Reuse connections to the frontend.** A proxy that keeps only a few idle
+  upstream connections dials a new one for most polls. Caddy's default of 32
+  did exactly that here, and a CPU profile showed 87% of its time inside
+  `connect()`.
+- **Don't cap requests per client connection.** A tab makes all its requests
+  over one HTTP/2 connection; nginx's default limit of 1000 requests would
+  force a reconnect and a new TLS handshake every few seconds.
 
 ## Multiple concurrent users
 
@@ -99,13 +155,14 @@ rooms are torn down automatically.
 The frontend caps the number of live rooms at 20 (`MAX_ROOMS`). A visitor past
 the cap sees "all rooms are in use" and is connected automatically once a room
 frees up, about 20 seconds after its tab closes. The default is a rough
-estimate for the $6 Droplet's single vCPU, where the limit is the request load
-of the tabs themselves rather than memory; raise `MAX_ROOMS` in
+estimate for a single shared vCPU, where the limit is the request load of the
+tabs themselves rather than memory; raise `MAX_ROOMS` in
 `docker-compose.yml` on a bigger machine, or set it to 0 to remove the cap.
 
 ## Teardown
 
 ```sh
-docker compose --profile tailnet down
+docker compose --profile public down
 ```
-…and destroy the Droplet to stop billing.
+…and destroy the Droplet to stop billing. Remove the DNS record too, so the
+name does not keep pointing at an address someone else may be given.

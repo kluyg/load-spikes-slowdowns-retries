@@ -1,0 +1,49 @@
+name: Deploy
+
+# Puts main on the public Droplet once CI has passed on it. Setup (the deploy
+# key, and the two repository variables below) is in DEPLOY.md. Without the
+# DEPLOY_HOST variable the job is skipped, so a fork never tries to deploy.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+# One deploy at a time, and never cancel one halfway through.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy main to the Droplet
+    # A workflow_run trigger also fires for pull requests whose branch happens
+    # to be called main, so require a push to this repository's own main.
+    if: >-
+      vars.DEPLOY_HOST != '' && (
+        github.event_name == 'workflow_dispatch' || (
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_repository.full_name == github.repository
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Run deploy.sh on the Droplet
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          # The commit CI tested. deploy.sh refuses anything not on main.
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "root@$DEPLOY_HOST" "$SHA"
