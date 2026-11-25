@@ -26,6 +26,14 @@
 // The frontend applies load shedding (fixed max QPS or in-flight quota),
 // enforces the queue-max limit, and propagates each client's deadline into the
 // work item.
+//
+// A client states its deadline the way gRPC's grpc-timeout does: as the time it
+// is still willing to wait (the Request-Timeout-Ms header), never as a
+// timestamp, so the client's clock is never compared with a server's. The
+// frontend turns that into an absolute deadline on its own clock when the
+// request arrives. From there on the deadline is a timestamp: the frontend and
+// backend are ours to keep in sync, and a timestamp keeps counting while the
+// item waits in the queue.
 package main
 
 import (
@@ -95,7 +103,42 @@ return n
 type workItem struct {
 	ID         string `json:"id"`
 	EnqueuedMs int64  `json:"enqueued_ms"`
-	DeadlineMs int64  `json:"deadline_ms"`
+	DeadlineMs int64  `json:"deadline_ms"` // absolute, on this server's clock; 0 = none
+}
+
+// timeoutHeader is how a client states its deadline on StartWork: the whole
+// milliseconds it is still willing to wait, counted from when it sent the
+// request. No header means no deadline.
+const timeoutHeader = "Request-Timeout-Ms"
+
+// maxTimeout bounds what a client may ask for. Nothing here waits anywhere
+// near this long; it only keeps the arithmetic far from overflow.
+const maxTimeout = 24 * time.Hour
+
+// parseTimeout reads a timeoutHeader value. hasDeadline is false when the
+// header is absent; a value that is not a non-negative whole number is an error.
+func parseTimeout(v string) (timeout time.Duration, hasDeadline bool, err error) {
+	if v == "" {
+		return 0, false, nil
+	}
+	ms, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil || ms < 0 {
+		return 0, false, fmt.Errorf("%s must be a whole number of milliseconds, got %q", timeoutHeader, v)
+	}
+	if ms > maxTimeout.Milliseconds() {
+		ms = maxTimeout.Milliseconds()
+	}
+	return time.Duration(ms) * time.Millisecond, true, nil
+}
+
+// deadlineMs converts the time a client has left into an absolute deadline
+// (unix ms) on this server's clock, counted from when its request arrived.
+// 0 means the client set no deadline.
+func deadlineMs(arrived time.Time, timeout time.Duration, hasDeadline bool) int64 {
+	if !hasDeadline {
+		return 0
+	}
+	return arrived.Add(timeout).UnixMilli()
 }
 
 type completion struct {
@@ -539,6 +582,14 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The client's deadline starts counting on our clock the moment its
+	// request arrives, not when we get around to enqueueing it.
+	arrived := time.Now()
+	timeout, hasDeadline, err := parseTimeout(r.Header.Get(timeoutHeader))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	s.touch(r.Context(), room)
 	rs := s.roomState(room)
 	rs.m.startWork.Add(1)
@@ -561,12 +612,11 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	deadlineMs, _ := strconv.ParseInt(r.URL.Query().Get("deadline_ms"), 10, 64)
 	nowMs := time.Now().UnixMilli()
 	// The id carries its enqueue time so GetOperation can tell whether an op
 	// predates the last queue clear (and is therefore gone) without any lookup.
 	id := strconv.FormatInt(nowMs, 10) + "-" + randHex()
-	item := workItem{ID: id, EnqueuedMs: nowMs, DeadlineMs: deadlineMs}
+	item := workItem{ID: id, EnqueuedMs: nowMs, DeadlineMs: deadlineMs(arrived, timeout, hasDeadline)}
 	b, _ := json.Marshal(item)
 	if err := s.rdb.LPush(r.Context(), roomKey(room, "work:queue"), b).Err(); err != nil {
 		rs.m.rpcFailure.Add(1)

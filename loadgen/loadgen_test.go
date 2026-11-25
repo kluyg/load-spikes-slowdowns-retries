@@ -127,6 +127,32 @@ func TestClientPolicy(t *testing.T) {
 	})
 }
 
+// The deadline goes to the frontend as time remaining in a header, never as a
+// timestamp from this machine's clock.
+func TestStartWorkSendsTimeRemaining(t *testing.T) {
+	var header, query atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/start" {
+			header.Store(r.Header.Get(timeoutHeader))
+			query.Store(r.URL.RawQuery)
+			fmt.Fprint(w, `{"operation_id":"1-abc"}`)
+			return
+		}
+		if r.Header.Get(timeoutHeader) != "" {
+			t.Errorf("GetOperation carried %s; only StartWork should", timeoutHeader)
+		}
+		fmt.Fprint(w, `{"status":"done"}`)
+	}))
+	t.Cleanup(srv.Close)
+	runOne(srv, ClientConfig{Deadline: 300 * time.Millisecond, Retry: "none"})
+	if got := header.Load(); got != "300" {
+		t.Errorf("%s = %q, want \"300\"", timeoutHeader, got)
+	}
+	if got := query.Load(); got != "room=r1" {
+		t.Errorf("StartWork query = %q, want only the room", got)
+	}
+}
+
 // timeline builds one second per entry from (logical, cohortOK, queue) rows.
 func timeline(rows ...[3]int) []second {
 	var tl []second

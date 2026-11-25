@@ -86,12 +86,18 @@ func retryDelay(strategy string, attempt int, rnd func() float64) time.Duration 
 	return 0 // immediate
 }
 
+// timeoutHeader tells the frontend how long this client will wait, in whole
+// milliseconds. Like gRPC's grpc-timeout it is time remaining, not a
+// timestamp: the frontend turns it into a deadline on its own clock, so this
+// machine's clock is never compared with the server's.
+const timeoutHeader = "Request-Timeout-Ms"
+
 // oneAttempt makes a single StartWork call and polls until its deadline.
 func (c *client) oneAttempt(ctx context.Context) outcome {
 	c.rec.attempt()
 	deadline := time.Now().Add(c.cfg.Deadline)
-	u := c.base + "/api/start?deadline_ms=" + strconv.FormatInt(deadline.UnixMilli(), 10) + "&room=" + c.room
-	status, body := c.do(ctx, http.MethodPost, u)
+	u := c.base + "/api/start?room=" + c.room
+	status, body := c.do(ctx, http.MethodPost, u, timeoutHeader, strconv.FormatInt(c.cfg.Deadline.Milliseconds(), 10))
 	if status == http.StatusTooManyRequests {
 		c.rec.shed()
 		return shed
@@ -135,10 +141,14 @@ func (c *client) pollUntilDone(ctx context.Context, id string, deadline time.Tim
 }
 
 // do returns the status code and body, or status 0 on a transport error.
-func (c *client) do(ctx context.Context, method, u string) (int, []byte) {
+// headers are name, value pairs.
+func (c *client) do(ctx context.Context, method, u string, headers ...string) (int, []byte) {
 	req, err := http.NewRequestWithContext(ctx, method, u, nil)
 	if err != nil {
 		return 0, nil
+	}
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
 	}
 	res, err := c.http.Do(req)
 	if err != nil {

@@ -155,3 +155,55 @@ func TestTouchDueOncePerWindow(t *testing.T) {
 		t.Errorf("%d of 64 concurrent touches were written, want 1", wrote.Load())
 	}
 }
+
+func TestParseTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		header      string
+		want        time.Duration
+		hasDeadline bool
+		wantErr     bool
+	}{
+		{"", 0, false, false}, // no header: no deadline
+		{"1000", time.Second, true, false},
+		{" 250 ", 250 * time.Millisecond, true, false},
+		{"0", 0, true, false}, // a deadline that has already passed, not "none"
+		{"99999999999999", maxTimeout, true, false},
+		{"-5", 0, false, true},
+		{"1.5", 0, false, true},
+		{"1000m", 0, false, true},          // gRPC's unit suffix is not accepted
+		{"1795618585743x", 0, false, true}, // nor anything else that is not a number
+	} {
+		got, hasDeadline, err := parseTimeout(tc.header)
+		if got != tc.want || hasDeadline != tc.hasDeadline || (err != nil) != tc.wantErr {
+			t.Errorf("parseTimeout(%q) = %s, %v, %v; want %s, %v, error=%v",
+				tc.header, got, hasDeadline, err, tc.want, tc.hasDeadline, tc.wantErr)
+		}
+	}
+}
+
+// The deadline is counted on this server's clock from the request's arrival;
+// nothing from the client's clock goes into it.
+func TestDeadlineMsCountsFromArrival(t *testing.T) {
+	arrived := time.UnixMilli(1795618585743)
+	if got := deadlineMs(arrived, time.Second, true); got != 1795618586743 {
+		t.Errorf("deadline = %d, want arrival + 1000 ms", got)
+	}
+	if got := deadlineMs(arrived, 0, true); got != 1795618585743 {
+		t.Errorf("deadline with nothing left = %d, want the arrival time itself", got)
+	}
+	if got := deadlineMs(arrived, time.Second, false); got != 0 {
+		t.Errorf("deadline with no timeout header = %d, want 0 (none)", got)
+	}
+}
+
+func TestStartRejectsMalformedTimeout(t *testing.T) {
+	s := &server{rooms: map[string]*roomState{}}
+	s.roomState("r1") // a known room, so admission never reaches Redis
+	r := httptest.NewRequest("POST", "/api/start?room=r1", nil)
+	r.Header.Set(timeoutHeader, "soon")
+	w := httptest.NewRecorder()
+	s.handleStart(w, r)
+	if w.Code != 400 {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
