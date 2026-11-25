@@ -28,32 +28,38 @@ services:
       # figure for one shared vCPU. 0 removes the cap.
       MAX_ROOMS: "20"
     # Loopback only, for the same reason as Redis: http://localhost:8080 works,
-    # and a deployed instance is reached through the Tailscale sidecar instead.
+    # and a deployed instance is reached through the proxy service below instead.
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
       - redis
     restart: unless-stopped
 
-  # Optional Tailscale sidecar. Only starts with:  docker compose --profile tailnet up
-  # It serves the frontend on your tailnet (https://frontend.<tailnet>.ts.net) by
-  # proxying to the frontend service over the Docker network. Needs TS_AUTHKEY in
-  # a (gitignored) .env file. The default `docker compose up` runs the plain local
-  # stack with no key required, so anyone can run it.
-  ts-frontend:
-    image: tailscale/tailscale:latest
-    profiles: ["tailnet"]
+  # Optional public entry point. Only starts with:
+  #   docker compose --profile public up
+  # nginx terminates HTTPS on 80/443 and proxies to the frontend over the Docker
+  # network. It gets and renews a Let's Encrypt certificate for SITE_ADDRESS by
+  # itself, so that must be a real hostname pointing at this machine, set in a
+  # (gitignored) .env file. See DEPLOY.md. The default `docker compose up` does
+  # not start it.
+  proxy:
+    build: ./proxy
+    profiles: ["public"]
     environment:
-      - TS_AUTHKEY=${TS_AUTHKEY}
-      - TS_HOSTNAME=frontend            # -> https://frontend.<your-tailnet>.ts.net
-      - TS_SERVE_CONFIG=/config/serve.json
-      - TS_STATE_DIR=/var/lib/tailscale
+      SITE_ADDRESS: ${SITE_ADDRESS:-}
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+      NGINX_ENVSUBST_FILTER: SITE_ADDRESS
+    # The only ports the stack publishes on every interface.
+    ports:
+      - "80:80"
+      - "443:443"
     volumes:
-      - ts-state:/var/lib/tailscale     # persists identity across restarts
-      - ./ts-config:/config
+      # The ACME account key and the certificate. Keep this volume: Let's
+      # Encrypt rate-limits how often a hostname can be issued a new one.
+      - acme-state:/var/lib/nginx-acme
     depends_on:
       - frontend
     restart: unless-stopped
 
 volumes:
-  ts-state:
+  acme-state:
