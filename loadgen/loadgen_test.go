@@ -183,16 +183,18 @@ func TestCheck(t *testing.T) {
 		res("retry-storm", 10, 5.5, 19000, -1),
 		res("clear-queue", 12, 5.5, 16000, -1),
 		res("shed", 51, 1, 66, 4),
+		res("margin-retry", 55, 4, 1400, 4),
 	}
 	if fails := check(good); len(fails) != 0 {
 		t.Errorf("the README's shape should pass, got: %v", fails)
 	}
 
 	bad := append([]Result(nil), good...)
-	bad[2] = res("lifo", 12, 1, 2000, 0)         // LIFO no better than FIFO
-	bad[4] = res("retry-storm", 10, 5.5, 900, 3) // storm that recovers on its own
+	bad[2] = res("lifo", 12, 1, 2000, 0)          // LIFO no better than FIFO
+	bad[4] = res("retry-storm", 10, 5.5, 900, 3)  // storm that recovers on its own
+	bad[7] = res("margin-retry", 12, 4, 1400, -1) // retries defeat the deadline drop
 	fails := strings.Join(check(bad), "\n")
-	for _, want := range []string{"lifo goodput", "retry-storm: 3s after the spike"} {
+	for _, want := range []string{"lifo goodput", "retry-storm: 3s after the spike", "margin-retry: should recover", "margin-retry goodput", "margin-retry peak queue"} {
 		if !strings.Contains(fails, want) {
 			t.Errorf("expected a failure mentioning %q, got:\n%s", want, fails)
 		}

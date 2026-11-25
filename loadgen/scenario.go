@@ -123,5 +123,9 @@ func scenarios() []Scenario {
 			s.Server.ShedMode = "inflight"
 			s.Server.InflightQuota = 70
 		}),
+		spikeScenario("margin-retry", "Spike, immediate retry x5, FIFO, deadline + margin (no shedding)", func(s *Scenario) {
+			immediateRetry(s)
+			s.Server.DeadlineMode = "margin"
+		}),
 	}
 }

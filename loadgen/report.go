@@ -189,6 +189,16 @@ func writeMarkdown(w io.Writer, results []Result) {
 		fmt.Fprintf(w, "| Total goodput | %.0f%% | %.0f%% |\n", off.GoodputPct, on.GoodputPct)
 		fmt.Fprintln(w)
 	}
+	if has("retry-storm", "margin-retry") {
+		off, on := by["retry-storm"], by["margin-retry"]
+		fmt.Fprintln(w, "| | No deadline drop | Deadline + margin |\n|---|---|---|")
+		fmt.Fprintf(w, "| Peak queue | %d | %d |\n", off.PeakQueue, on.PeakQueue)
+		fmt.Fprintf(w, "| Goodput during spike | %.0f/s | %.0f/s |\n", off.SpikeGoodput, on.SpikeGoodput)
+		fmt.Fprintf(w, "| After the spike | %s | %s |\n", afterSpike(off), afterSpike(on))
+		fmt.Fprintf(w, "| Offered amplification | %.2f× | %.2f× |\n", off.Amplification, on.Amplification)
+		fmt.Fprintf(w, "| Total goodput | %.0f%% | %.0f%% |\n", off.GoodputPct, on.GoodputPct)
+		fmt.Fprintln(w)
+	}
 }
 
 func afterSpike(r Result) string {
@@ -264,6 +274,14 @@ func check(results []Result) []string {
 	}
 	if s, o, ok := both("shed", "retry-storm"); ok {
 		claim(s.GoodputPct >= o.GoodputPct+20, "shed goodput %.0f%% should beat no-shedding %.0f%% by 20+ points", s.GoodputPct, o.GoodputPct)
+	}
+	if r, ok := by["margin-retry"]; ok {
+		claim(r.Amplification >= 2, "margin-retry: amplification %.2fx, want the retry storm to still form (>= 2x)", r.Amplification)
+		claim(r.recovered(), "margin-retry: should recover after the spike")
+	}
+	if m, o, ok := both("margin-retry", "retry-storm"); ok {
+		claim(m.GoodputPct >= o.GoodputPct+20, "margin-retry goodput %.0f%% should beat no-deadline-drop %.0f%% by 20+ points", m.GoodputPct, o.GoodputPct)
+		claim(m.PeakQueue*2 < o.PeakQueue, "margin-retry peak queue %d should be under half of the retry storm's %d", m.PeakQueue, o.PeakQueue)
 	}
 	return fails
 }
