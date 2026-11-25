@@ -87,7 +87,8 @@ spike a few seconds in:
    ends*. The load is gone but the system is still dead.
 3. **Shed & survive** — same aggressive client, but load shedding holds goodput
    at capacity and recovers instantly.
-4. **Deadline + margin** — the backend-side cure: bounded queue, goodput survives.
+4. **Deadline + margin** — the backend-side cure: same aggressive client, no
+   shedding, yet the queue stays bounded and goodput survives.
 
 Or drive the knobs yourself with **Start load** and the panels below.
 
@@ -168,6 +169,24 @@ Shedding caps the queue at the quota so the backend always has fresh work it can
 finish in time. Because the client honors the 429 (stops instead of retrying),
 shedding also prevents the retry storm from forming in the first place.
 
+**5. Deadline propagation cures it from the backend side.** Same immediate-retry
+spike, no shedding, but the backend drops work it can't finish with 70 ms to spare:
+
+| | No deadline drop | Deadline + margin |
+|---|---|---|
+| Queue during spike | explodes → 13,800+ | plateaus near 1,400 |
+| Goodput during spike | 0 | ~73/s (≈ capacity) |
+| After the spike | collapsed indefinitely | new requests healthy in ~4s |
+| Offered amplification | 5.25× | 4× (the storm still forms) |
+| Total goodput | 12% | 55% |
+
+A dropped operation tells the client nothing, so it waits out its deadline and
+retries: unlike shedding, this does *not* stop the retry storm. But refusing
+doomed work is nearly free, so the workers only spend time on requests that can
+still succeed. The queue levels off at about one deadline's worth of attempts
+instead of growing without bound, and once the spike ends the retries run out
+rather than sustaining themselves.
+
 ## Reproducing the numbers
 
 The tables above come from [`loadgen/`](loadgen/), a headless twin of the
@@ -186,7 +205,8 @@ go run . -check                      # exit 1 if a claim above stops holding
 Each scenario runs in its own fresh room, so runs don't contaminate each other
 or anyone using the UI. `-check` asserts the *shapes* (LIFO and deadline + margin
 beat FIFO, retries amplify and never recover, clearing the queue doesn't help,
-shedding pins the queue and recovers), not the absolute numbers, and CI runs it
+shedding pins the queue and recovers, deadline + margin survives the retry
+storm), not the absolute numbers, and CI runs it
 against the real `docker compose` stack on every push.
 
 ## Implementation notes

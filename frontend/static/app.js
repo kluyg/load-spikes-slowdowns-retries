@@ -517,8 +517,8 @@ const PRESETS = [
   },
   {
     name: "Deadline + margin",
-    desc: "No shedding, but the backend refuses work it can't finish in time. Auto-spikes in 4s — queue stays bounded and goodput survives (the backend-side cure).",
-    client: { qps: 60, clientDeadlineMs: 1000, retryStrategy: "none", maxRetries: 0 },
+    desc: "Same aggressive client, no shedding, but the backend refuses work it can't finish in time. Auto-spikes in 4s — the retry storm still forms, yet the queue stays bounded, goodput holds near capacity, and the system recovers once the retries run out (the backend-side cure).",
+    client: { qps: 60, clientDeadlineMs: 1000, retryStrategy: "immediate", maxRetries: 5 },
     config: { shed_mode: "none", max_qps: 0, inflight_quota: 0, queue_mode: "FIFO", queue_max: 0, deadline_mode: "margin", margin_ms: 70, latency_mode: "uniform", latency_ms: 50 },
     autoSpike: "load",
   },
