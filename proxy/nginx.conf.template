@@ -17,8 +17,10 @@ http {
 
 	# Docker's embedded DNS. The ACME client needs a resolver to reach Let's
 	# Encrypt, and the upstream below uses it to follow the frontend container
-	# to a new address when a deploy recreates it.
-	resolver 127.0.0.11 valid=10s;
+	# to a new address when a deploy recreates it. IPv4 only: the default
+	# Docker network has no IPv6 route, and without this the ACME client tries
+	# Let's Encrypt's IPv6 address first and logs an error before falling back.
+	resolver 127.0.0.11 valid=10s ipv6=off;
 
 	acme_issuer letsencrypt {
 		uri https://acme-v02.api.letsencrypt.org/directory;
