@@ -3,14 +3,19 @@
 The laptop-served Funnel URL is only live while your machine is awake. For a
 durable public link, run the same compose on a small always-on Droplet. Tailscale Funnel gives free HTTPS and needs **no inbound ports** open
 (ingress arrives over Tailscale's own connection), so the box's only exposed
-port is SSH.
+port is SSH. The compose file publishes Redis (6379) and the frontend (8080) on
+`127.0.0.1` only, which is what keeps that true: Docker's port publishing
+bypasses `ufw`, so a port published on all interfaces would be reachable from
+the internet no matter what the host firewall says.
 
 ## 1. Create the Droplet (DigitalOcean web console)
 
 - **Image:** Ubuntu 24.04 (LTS) x64
 - **Plan:** Basic → Regular → **$6/mo (1 GB / 1 vCPU)**. 1 GB matters only so the
   in-VM Go build doesn't OOM; the running stack uses far less.
-- **Region:** closest to you (or to your users).
+- **Region:** closest to you (or to your users). Not every datacenter offers
+  the Basic Regular plans; if the $6 plan shows as unavailable (NYC2 did in
+  November 2026), pick another datacenter in the same city, such as NYC3.
 - **Auth:** add your SSH key.
 - Create, and note the Droplet's IP.
 
@@ -50,20 +55,29 @@ docker compose --profile tailnet up -d --build
 
 ## 4. Claim the canonical URL (optional but tidy)
 
-To serve at the same `https://frontend.<tailnet>.ts.net` you already tested, free
-that hostname from the laptop first:
+If another machine on your tailnet already holds the name `frontend` (the
+laptop you tested from, or an earlier Droplet that has since been destroyed),
+the new node registers as `frontend-1` and serves at
+`https://frontend-1.<tailnet>.ts.net`. To serve at
+`https://frontend.<tailnet>.ts.net` instead:
 
-```sh
-# on your laptop:
-docker compose --profile tailnet down
-```
-Then in the Tailscale admin console → **Machines**, remove the old `frontend`
-(laptop) node. If the Droplet already registered as `frontend-1`, restart its
-sidecar so it reclaims `frontend`:
+1. If the old node is your laptop, stop its sidecar first:
 
-```sh
-docker compose --profile tailnet restart ts-frontend
-```
+   ```sh
+   # on your laptop:
+   docker compose --profile tailnet down
+   ```
+2. In the Tailscale admin console → **Machines**, open the old `frontend`
+   node's **⋯** menu and choose **Remove**.
+3. On the same page, open the **⋯** menu of `frontend-1` → **Edit machine
+   name**, turn off **Auto-generate from OS hostname**, and set the name to
+   `frontend`.
+
+The rename is needed: once a node has been given `frontend-1`, restarting the
+sidecar keeps that name even after `frontend` is free. Funnel follows the new
+name within a few seconds, and the `frontend-1` URL stops working. To skip the
+rename altogether, do steps 1 and 2 before the first
+`docker compose --profile tailnet up` on the Droplet.
 
 ## 5. Verify
 
