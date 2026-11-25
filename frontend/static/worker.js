@@ -102,10 +102,20 @@ function retryDelay(attempt) {
 
 // oneAttempt makes a single StartWork call and polls until its deadline.
 // Returns "ok" | "timeout" | "shed".
+//
+// The server is told how long we will wait, not when we will stop: like gRPC's
+// grpc-timeout, the deadline travels as time remaining, and the server turns it
+// into a deadline on its own clock. This clock is never compared with the
+// server's, so it can be wrong by any amount. Our own copy of the deadline
+// lives on the monotonic clock, which a wall-clock adjustment can't move.
 async function oneAttempt() {
-  const deadline = Date.now() + clientDeadlineMs;
+  const timeoutMs = Math.max(0, Math.round(clientDeadlineMs));
+  const deadline = performance.now() + timeoutMs;
   try {
-    const res = await fetch("/api/start?deadline_ms=" + deadline + "&room=" + room, { method: "POST" });
+    const res = await fetch("/api/start?room=" + room, {
+      method: "POST",
+      headers: { "Request-Timeout-Ms": String(timeoutMs) },
+    });
     if (res.status === 429) return "shed"; // explicit backpressure
     if (!res.ok) return "timeout";
     const { operation_id } = await res.json();
@@ -116,7 +126,7 @@ async function oneAttempt() {
 }
 
 async function pollUntilDone(id, deadline) {
-  while (Date.now() < deadline) {
+  while (performance.now() < deadline) {
     await sleep(POLL_INTERVAL_MS);
     try {
       const res = await fetch("/api/op?id=" + encodeURIComponent(id) + "&room=" + room);

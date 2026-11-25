@@ -197,6 +197,16 @@ against the real `docker compose` stack on every push.
   exact overload these metrics exist to measure.
 - **Redis is the only broker:** work queue, completion bus, config, and metrics
   all live in it, which keeps the moving parts minimal.
+- **The client sends its deadline as time remaining, not as a timestamp.**
+  `StartWork` carries a `Request-Timeout-Ms` header (how long the client will
+  still wait, the same idea as gRPC's `grpc-timeout`), and the frontend turns it
+  into an absolute deadline on its own clock when the request arrives. A
+  browser's clock can be off by seconds; with a 70 ms margin, comparing it with
+  the server's would decide what the backend refuses. From the frontend on, the
+  deadline is a plain timestamp in the work item: the frontend and backend are
+  ours to keep in sync, and a timestamp keeps counting while the item sits in
+  the queue. As in gRPC, the trip from client to frontend is not counted, so
+  the server's deadline runs later than the client's by that much.
 - **Rooms are just a key prefix plus a pool per room.** Isolation costs almost
   nothing structurally — every room's state is `room:<id>:…` keys and the
   backend scales workers with the number of live rooms. Idle rooms are garbage

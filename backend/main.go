@@ -52,9 +52,9 @@ const (
 	managePeriod = 500 * time.Millisecond
 	// A finished op's "done" record only matters while its client is still
 	// polling, i.e. until the op's deadline. Keep it that long plus doneBuffer
-	// (generous slack for clock skew between browser and server, and for a late
-	// final poll), never longer than doneMaxTTL however far out the client-
-	// supplied deadline claims to be.
+	// (generous slack for a late final poll, and for skew between the
+	// frontend's clock, which stamped the deadline, and ours), never longer
+	// than doneMaxTTL however long the client said it would wait.
 	doneBuffer = 60 * time.Second
 	doneMaxTTL = time.Hour
 )
@@ -79,7 +79,12 @@ func defaultConfig() Config {
 type workItem struct {
 	ID         string `json:"id"`
 	EnqueuedMs int64  `json:"enqueued_ms"`
-	DeadlineMs int64  `json:"deadline_ms"` // absolute client deadline (unix ms)
+	// DeadlineMs is the client's deadline as an absolute time (unix ms) on the
+	// frontend's clock; 0 means none. The client sent only how long it would
+	// wait and the frontend stamped this on arrival, so comparing it with our
+	// clock assumes the frontend and backend are in sync -- which we control --
+	// and never involves the client's clock.
+	DeadlineMs int64 `json:"deadline_ms"`
 }
 
 type completion struct {
