@@ -5,6 +5,12 @@ load_module modules/ngx_http_acme_module.so;
 
 worker_processes auto;
 
+# Each proxied request holds two descriptors, one to the client and one to the
+# frontend, and idle upstream connections are kept open on top of that.
+# Docker's default soft limit of 1024 runs out under a retry storm, and nginx
+# then fails requests with "No file descriptors available".
+worker_rlimit_nofile 16384;
+
 events {
 	worker_connections 8192;
 }
